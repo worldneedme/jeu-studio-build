@@ -529,7 +529,95 @@ jobs:
           }
           Write-Host "  [OK] Positive test passed: JEU Studio backend service successfully stopped and confirmed dead."
 
+          # 11B. Upgrade test: run the installed desktop shell and bundled backend,
+          # then run the same installer over the live installation. The installer
+          # must close only this installation's processes before replacing files.
+          Write-Host "11B. Upgrade test: cover live JEUStudio.exe and bundled node.exe..."
           Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 2
+          Set-Content -Path "D:\JEU-Studio\data\upgrade-canary.txt" -Value "JEU_UPGRADE_DATA_CANARY_123" -Encoding UTF8
+          Set-Content -Path "D:\JEU-Studio\sessions\upgrade-canary.txt" -Value "JEU_UPGRADE_SESSION_CANARY_123" -Encoding UTF8
+          $upgradeApp = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "-no-open","-port","9734" -WorkingDirectory "D:\JEU-Studio" -PassThru
+          Write-Host "  Live desktop process PID: $($upgradeApp.Id)"
+          $upgradeHealthy = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $upgradeHealth = Invoke-RestMethod -Uri "http://127.0.0.1:9734/studio/health" -TimeoutSec 2 -ErrorAction Stop
+              if ($upgradeHealth.ok -eq $true) {
+                $upgradeHealthy = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $upgradeHealthy) {
+            throw "Upgrade setup failed: live JEUStudio.exe did not become healthy on port 9734."
+          }
+          $upgradeBackendPid = $null
+          if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
+            $upgradePidInfo = Get-Content "D:\JEU-Studio\data\local-server.pid.json" -Raw | ConvertFrom-Json
+            $upgradeBackendPid = [int]$upgradePidInfo.pid
+          }
+          if (-not $upgradeBackendPid) {
+            throw "Upgrade setup failed: bundled backend PID file was not created."
+          }
+          Write-Host "  Live bundled backend PID: $upgradeBackendPid"
+
+          $upgradeLog = Join-Path $env:RUNNER_TEMP "jeu-upgrade.log"
+          $upgradeInstaller = Start-Process -FilePath ".\JEUStudio-Setup-x64.exe" -ArgumentList @(
+            "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=$upgradeLog"
+          ) -PassThru
+          if (-not $upgradeInstaller.WaitForExit(120000)) {
+            Stop-Process -Id $upgradeInstaller.Id -Force -ErrorAction SilentlyContinue
+            throw "Upgrade installer did not exit within 120 seconds."
+          }
+          Write-Host "  Upgrade installer exit code: $($upgradeInstaller.ExitCode)"
+          if ($upgradeInstaller.ExitCode -ne 0) {
+            if (Test-Path $upgradeLog) { Get-Content $upgradeLog }
+            throw "Upgrade installer exited with failure code $($upgradeInstaller.ExitCode)."
+          }
+          if (Test-Path $upgradeLog) {
+            $upgradeLogText = Get-Content $upgradeLog -Raw
+            if ($upgradeLogText -match '(?i)DeleteFile failed|code 5|access is denied') {
+              Get-Content $upgradeLog
+              throw "Upgrade installer log contains a locked-file failure (DeleteFile/code 5/access denied)."
+            }
+          }
+
+          Start-Sleep -Seconds 2
+          if (Get-Process -Id $upgradeApp.Id -ErrorAction SilentlyContinue) {
+            throw "Upgrade test failed: old JEUStudio.exe process PID $($upgradeApp.Id) is still running."
+          }
+          if (Get-Process -Id $upgradeBackendPid -ErrorAction SilentlyContinue) {
+            throw "Upgrade test failed: old bundled backend PID $upgradeBackendPid is still running."
+          }
+          if ((Get-Content "D:\JEU-Studio\data\upgrade-canary.txt" -Raw) -notmatch 'JEU_UPGRADE_DATA_CANARY_123') {
+            throw "Upgrade test failed: data canary was not preserved."
+          }
+          if ((Get-Content "D:\JEU-Studio\sessions\upgrade-canary.txt" -Raw) -notmatch 'JEU_UPGRADE_SESSION_CANARY_123') {
+            throw "Upgrade test failed: sessions canary was not preserved."
+          }
+          Write-Host "  [OK] Live upgrade completed without DeleteFile/code 5 and preserved user data."
+
+          $postUpgradeApp = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "-no-open","-port","9734" -WorkingDirectory "D:\JEU-Studio" -PassThru
+          $postUpgradeHealthy = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $postUpgradeHealth = Invoke-RestMethod -Uri "http://127.0.0.1:9734/studio/health" -TimeoutSec 2 -ErrorAction Stop
+              if ($postUpgradeHealth.ok -eq $true) {
+                $postUpgradeHealthy = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $postUpgradeHealthy) {
+            throw "Upgrade test failed: replacement JEUStudio.exe did not start successfully."
+          }
+          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          Stop-Process -Id $postUpgradeApp.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "  [OK] Replacement desktop shell started successfully after upgrade."
+
           Write-Host "Windows native installation, health check, proxy route and shutdown verification successful!"
 
           Write-Host "12. Integration Verification: Dev Repository Layout (D:\code\projects\nbl) & Clean Environment Path Isolation..."
