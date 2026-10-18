@@ -241,14 +241,44 @@ jobs:
           )
           $mockFile = Join-Path $env:RUNNER_TEMP "mock_backend.py"
           Set-Content -Path $mockFile -Value ($pyCode -join "`n") -Encoding utf8
-          $mockProc = Start-Process python -ArgumentList "$mockFile `"$testRoot`" $backendPort" -PassThru
-          Start-Sleep -Seconds 1
+          $mockOut = Join-Path $env:RUNNER_TEMP "mock_out.txt"
+          $mockErr = Join-Path $env:RUNNER_TEMP "mock_err.txt"
+          $mockProc = Start-Process python `
+            -ArgumentList @($mockFile, $testRoot, "$backendPort") `
+            -RedirectStandardOutput $mockOut `
+            -RedirectStandardError $mockErr `
+            -PassThru
+
+          Write-Host "  Waiting for mock backend to listen on port $backendPort..."
+          $started = $false
+          for ($i = 0; $i -lt 20; $i++) {
+            Start-Sleep -Milliseconds 250
+            if ($mockProc.HasExited) {
+              $errContent = if (Test-Path $mockErr) { Get-Content $mockErr -Raw } else { "" }
+              throw "Mock backend process exited unexpectedly with code $($mockProc.ExitCode)! Stderr: $errContent"
+            }
+            try {
+              $client = New-Object System.Net.Sockets.TcpClient
+              $client.Connect("127.0.0.1", $backendPort)
+              $client.Close()
+              $started = $true
+              break
+            } catch {
+              # wait and retry
+            }
+          }
+          if (-not $started) {
+            $errContent = if (Test-Path $mockErr) { Get-Content $mockErr -Raw } else { "" }
+            throw "Mock backend failed to start listening on 127.0.0.1:$backendPort within 5 seconds! Stderr: $errContent"
+          }
+          Write-Host "  [OK] Mock backend is listening on 127.0.0.1:$backendPort."
 
           Write-Host "5a. Verifying Ready Backend proxy forwarding (matching root 200)..."
           $healthReady = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
           if ($healthReady.ok -ne $true -or $healthReady.backendReady -ne $true) {
+            $errContent = if (Test-Path $mockErr) { Get-Content $mockErr -Raw } else { "" }
             Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
-            throw "Assertion failed: health must indicate backendReady: true when mock backend is ready!"
+            throw "Assertion failed: health must indicate backendReady: true when mock backend is ready! (got ok=$($healthReady.ok), backendReady=$($healthReady.backendReady), localStatus=$($healthReady.localStatus), mockStderr=$errContent)"
           }
           Write-Host "  [OK] /studio/health indicates backendReady: true."
 
