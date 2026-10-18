@@ -1,0 +1,182 @@
+name: Rust Windows Native Foundation CI
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Target private nbl commit SHA'
+        required: true
+        type: string
+
+jobs:
+  rust-windows:
+    name: Rust Windows x64 Native Foundation
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validate source SHA format
+        run: |
+          $sha = "${{ inputs.source_sha }}".Trim()
+          if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Invalid source_sha '$sha'. Must be a full 40-character hexadecimal SHA."
+          }
+          Write-Host "Target private source SHA: $sha"
+
+      - name: Checkout private nbl source
+        uses: actions/checkout@v4
+        with:
+          repository: worldneedme/nbl
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - name: Assert exact commit checkout
+        run: |
+          $checkedOutSha = (git rev-parse HEAD).Trim()
+          $expectedSha = "${{ inputs.source_sha }}".Trim()
+          Write-Host "Checked out HEAD SHA: $checkedOutSha"
+          Write-Host "Expected target SHA:  $expectedSha"
+          if ($checkedOutSha -ne $expectedSha) {
+            throw "Checkout mismatch! Checked out $checkedOutSha but expected $expectedSha"
+          }
+
+      - name: Setup Rust Stable Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: x86_64-pc-windows-msvc
+
+      - name: Verify Formatting (cargo fmt --check)
+        run: |
+          Write-Host "Running cargo fmt --check..."
+          cargo fmt --check --manifest-path rust/Cargo.toml
+
+      - name: Run Unit & Integration Tests (cargo test)
+        run: |
+          Write-Host "Running cargo test on x86_64-pc-windows-msvc..."
+          cargo test --manifest-path rust/Cargo.toml --target x86_64-pc-windows-msvc -- --nocapture
+
+      - name: Build Release Binary (cargo build --release)
+        run: |
+          Write-Host "Compiling release binary..."
+          cargo build --release --manifest-path rust/Cargo.toml --target x86_64-pc-windows-msvc
+
+      - name: Verify Executable & Compute Checksum
+        id: checksum
+        run: |
+          $exePath = "rust/target/x86_64-pc-windows-msvc/release/jeu-studio-native.exe"
+          if (-not (Test-Path $exePath)) {
+            throw "Expected executable not found at $exePath!"
+          }
+          $item = Get-Item $exePath
+          $hash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash.ToLower()
+          Write-Host "=========================================="
+          Write-Host "Executable: $($item.FullName)"
+          Write-Host "Size:       $($item.Length) bytes"
+          Write-Host "SHA256:     $hash"
+          Write-Host "=========================================="
+          echo "exe_hash=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Smoke Test Health Probe & Host Validation on Windows
+        run: |
+          $exePath = (Resolve-Path "rust/target/x86_64-pc-windows-msvc/release/jeu-studio-native.exe").Path
+          $testPort = 9877
+          $testRoot = Join-Path $env:RUNNER_TEMP "jeu-r1-smoke-test"
+          New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
+
+          Write-Host "1. Launching jeu-studio-native.exe on 127.0.0.1:$testPort with injected test root..."
+          $proc = Start-Process -FilePath $exePath `
+            -ArgumentList "--port", "$testPort", "--no-open", "--root", "$testRoot" `
+            -PassThru
+
+          Write-Host "  Started PID: $($proc.Id)"
+          Start-Sleep -Seconds 2
+
+          if ($proc.HasExited) {
+            throw "Executable exited unexpectedly with code $($proc.ExitCode)!"
+          }
+
+          Write-Host "2. Probing GET /studio/health on 127.0.0.1:$testPort..."
+          $healthOk = $false
+          $healthData = $null
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $resp = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/studio/health" -TimeoutSec 2 -ErrorAction Stop
+              $healthData = $resp
+              $healthOk = $true
+              break
+            } catch {
+              Write-Host "  Waiting for health probe... ($($_.Exception.Message))"
+            }
+          }
+
+          if (-not $healthOk) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Failed to reach /studio/health probe within timeout!"
+          }
+
+          Write-Host "  Health Response: $($healthData | ConvertTo-Json -Compress)"
+
+          # Assertions on health response
+          if ($healthData.ok -ne $false) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Assertion failed: health.ok must be false in R1 baseline, got $($healthData.ok)!"
+          }
+          if ($healthData.backendReady -ne $false) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Assertion failed: health.backendReady must be false in R1 baseline, got $($healthData.backendReady)!"
+          }
+          if ($healthData.application -ne "JEU Studio") {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Assertion failed: health.application must be 'JEU Studio', got $($healthData.application)!"
+          }
+          if ($healthData.rootDir -ne $testRoot) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Assertion failed: health.rootDir must be '$testRoot', got '$($healthData.rootDir)'!"
+          }
+          Write-Host "  [OK] Health probe response verified: ok=false, backendReady=false, rootDir matches."
+
+          Write-Host "3. Negative test: Foreign Host header must be rejected with HTTP 403 Forbidden..."
+          $forbiddenBlocked = $false
+          try {
+            $badReq = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/studio/health" -Headers @{ "Host" = "evil.com" } -SkipHttpErrorCheck -TimeoutSec 2
+            Write-Host "  Status code received for evil.com Host: $($badReq.StatusCode)"
+            if ($badReq.StatusCode -eq 403) {
+              $forbiddenBlocked = $true
+            }
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -eq 403) {
+              $forbiddenBlocked = $true
+            }
+          }
+
+          if (-not $forbiddenBlocked) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "Host validation negative test failed: Host 'evil.com' was not rejected with 403 Forbidden!"
+          }
+          Write-Host "  [OK] Negative test passed: foreign Host rejected with HTTP 403 Forbidden."
+
+          Write-Host "4. Verifying read-only behavior (no files written to root directory)..."
+          $items = Get-ChildItem -Path $testRoot
+          if ($items.Count -gt 0) {
+            Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+            throw "R1 violation: executable wrote files to root directory ($($items.Name -join ', '))!"
+          }
+          Write-Host "  [OK] Verified zero files/directories written to root directory."
+
+          Write-Host "5. Shutting down smoke test process cleanly..."
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 1
+          Write-Host "  [OK] Smoke test process terminated."
+
+      - name: Upload Non-Public Debug Artifact (Retention 7 days)
+        uses: actions/upload-artifact@v4
+        with:
+          name: jeu-studio-native-windows-x64
+          path: rust/target/x86_64-pc-windows-msvc/release/jeu-studio-native.exe
+          retention-days: 7
+          if-no-files-found: error
