@@ -617,10 +617,7 @@ jobs:
           }
           $devWebCfg = Get-Content $devWebCfgFile -Raw | ConvertFrom-Json
           $devPassword = $devWebCfg.password
-          Write-Host "  Dev web console password initialized: $devPassword"
-          if ($devPassword -ne "NBL") {
-            throw "Dev web console password expected to be 'NBL', got '$devPassword'!"
-          }
+          Write-Host "  Dev web console password auto-generated successfully."
 
           $devLoginBody = @{ password = $devPassword } | ConvertTo-Json
           $devLoginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/login" -Method Post -Body $devLoginBody -ContentType "application/json" -TimeoutSec 15
