@@ -584,18 +584,23 @@ jobs:
           Write-Host "  Dev Working Directory:   $devRoot"
 
           # 12A. Check HTTP response headers on 9527
-          $devHeadReq = Invoke-WebRequest -Uri "http://127.0.0.1:9527/api/status" -UseBasicParsing -TimeoutSec 5
-          $headerRoot = $devHeadReq.Headers['X-JEU-Studio-Root']
-          $headerProfile = $devHeadReq.Headers['X-JEU-Studio-Profile']
-          $headerVersion = $devHeadReq.Headers['X-JEU-Studio-Version']
+          $devHeadReq = $null
+          try {
+            $devHeadReq = Invoke-WebRequest -Uri "http://127.0.0.1:9527/api/status" -SkipHttpErrorCheck -TimeoutSec 5
+          } catch {
+            $devHeadReq = $_.Exception.Response
+          }
+          $headerRoot = if ($devHeadReq.Headers['X-JEU-Studio-Root']) { "$($devHeadReq.Headers['X-JEU-Studio-Root'])" } else { "" }
+          $headerProfile = if ($devHeadReq.Headers['X-JEU-Studio-Profile']) { "$($devHeadReq.Headers['X-JEU-Studio-Profile'])" } else { "" }
+          $headerVersion = if ($devHeadReq.Headers['X-JEU-Studio-Version']) { "$($devHeadReq.Headers['X-JEU-Studio-Version'])" } else { "" }
           Write-Host "  Dev Response X-JEU-Studio-Root:    $headerRoot"
           Write-Host "  Dev Response X-JEU-Studio-Profile: $headerProfile"
           Write-Host "  Dev Response X-JEU-Studio-Version: $headerVersion"
 
-          if ($headerRoot -ne $devRoot) {
+          if ([System.IO.Path]::GetFullPath($headerRoot) -ne [System.IO.Path]::GetFullPath($devRoot)) {
             throw "Dev verification failed: X-JEU-Studio-Root is '$headerRoot', expected '$devRoot'!"
           }
-          if ($headerProfile -ne "$devRoot\sessions\chrome-profile") {
+          if ([System.IO.Path]::GetFullPath($headerProfile) -ne [System.IO.Path]::GetFullPath("$devRoot\sessions\chrome-profile")) {
             throw "Dev verification failed: X-JEU-Studio-Profile is '$headerProfile', expected '$devRoot\sessions\chrome-profile'!"
           }
           if ($headerProfile -match '\.notebooklm') {
@@ -629,16 +634,16 @@ jobs:
           Write-Host "  Dev paths.profileDir:  $($paths.profileDir)"
           Write-Host "  Dev paths.sessionFile: $($paths.sessionFile)"
 
-          if ($paths.root -ne $devRoot) {
+          if ([System.IO.Path]::GetFullPath($paths.root) -ne [System.IO.Path]::GetFullPath($devRoot)) {
             throw "Dev verification failed: paths.root is '$($paths.root)', expected '$devRoot'!"
           }
-          if ($paths.homeDir -ne "$devRoot\sessions") {
+          if ([System.IO.Path]::GetFullPath($paths.homeDir) -ne [System.IO.Path]::GetFullPath("$devRoot\sessions")) {
             throw "Dev verification failed: paths.homeDir is '$($paths.homeDir)', expected '$devRoot\sessions'!"
           }
-          if ($paths.profileDir -ne "$devRoot\sessions\chrome-profile") {
+          if ([System.IO.Path]::GetFullPath($paths.profileDir) -ne [System.IO.Path]::GetFullPath("$devRoot\sessions\chrome-profile")) {
             throw "Dev verification failed: paths.profileDir is '$($paths.profileDir)', expected '$devRoot\sessions\chrome-profile'!"
           }
-          if ($paths.sessionFile -ne "$devRoot\sessions\session.json") {
+          if ([System.IO.Path]::GetFullPath($paths.sessionFile) -ne [System.IO.Path]::GetFullPath("$devRoot\sessions\session.json")) {
             throw "Dev verification failed: paths.sessionFile is '$($paths.sessionFile)', expected '$devRoot\sessions\session.json'!"
           }
           foreach ($p in @($paths.root, $paths.homeDir, $paths.profileDir, $paths.sessionFile)) {
@@ -667,14 +672,14 @@ jobs:
 
           # 12E. Verify backend ownership reuse: matching root allowed, mismatch rejected
           # Matching root (D:\code\projects\nbl):
-          if ($headerRoot -eq $devRoot) {
+          if ([System.IO.Path]::GetFullPath($headerRoot) -eq [System.IO.Path]::GetFullPath($devRoot)) {
             Write-Host "  [OK] Dev launcher matching root ($devRoot) allows backend reuse."
           } else {
             throw "Ownership check failed: expected matching root."
           }
 
           # Mismatch root (D:\JEU-Studio) against Dev backend:
-          if ($headerRoot -ne "D:\JEU-Studio") {
+          if ([System.IO.Path]::GetFullPath($headerRoot) -ne [System.IO.Path]::GetFullPath("D:\JEU-Studio")) {
             Write-Host "  [OK] Installer launcher root (D:\JEU-Studio) correctly identifies dev backend as foreign ($headerRoot) and refuses reuse."
           }
 
