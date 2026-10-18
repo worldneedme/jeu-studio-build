@@ -745,5 +745,217 @@ jobs:
           }
           Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           Write-Host "  [OK] Backend process PID $backendPid precisely cleaned up."
+
+          Write-Host "================================================================="
+          Write-Host "11. Negative Test: Non-HTTP Listener (Junk Protocol)"
+          Write-Host "================================================================="
+          $nonHttpPort = 9545
+          $rustNonHttpPort = 9745
+          $pyNonHttpCode = @"
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $nonHttpPort))
+s.listen(5)
+print('LISTENING')
+sys.stdout.flush()
+while True:
+    try:
+        conn, addr = s.accept()
+        conn.sendall(b'RAW_NON_HTTP_JUNK_PROTOCOL\r\n\r\n')
+        conn.close()
+    except:
+        break
+"@
+          $nonHttpPyFile = Join-Path $env:RUNNER_TEMP "mock_non_http.py"
+          Set-Content -Path $nonHttpPyFile -Value $pyNonHttpCode -Encoding utf8
+          $nonHttpProc = Start-Process python -ArgumentList @($nonHttpPyFile) -PassThru
+          Start-Sleep -Seconds 1
+
+          $rustNonHttp = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$pkgRoot", "--port", "$rustNonHttpPort", "--backend-port", "$nonHttpPort", "--no-backend", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 2
+
+          # Health must report backendReady: false and conflicting/non-HTTP status
+          $healthNonHttp = Invoke-RestMethod -Uri "http://127.0.0.1:$rustNonHttpPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Non-HTTP health: backendReady=$($healthNonHttp.backendReady), status=$($healthNonHttp.localStatus)"
+          if ($healthNonHttp.backendReady -ne $false) {
+            throw "Expected backendReady: false for non-HTTP backend port!"
+          }
+          if ($healthNonHttp.localStatus -notlike "*非 HTTP*" -and $healthNonHttp.localStatus -notlike "*异常服务*") {
+            throw "Expected non-HTTP diagnostic message, got: $($healthNonHttp.localStatus)"
+          }
+
+          # API must be blocked with 503
+          $apiNonHttp = Get-HttpStatusAndBody "http://127.0.0.1:$rustNonHttpPort/api/status"
+          if ($apiNonHttp.StatusCode -ne 503) {
+            throw "Expected HTTP 503 for non-HTTP backend, got $($apiNonHttp.StatusCode)"
+          }
+          Write-Host "  [OK] /api/status blocked with HTTP 503 on non-HTTP listener."
+
+          # External listener must STILL be alive
+          if ($nonHttpProc.HasExited) {
+            throw "External non-HTTP listener process was killed!"
+          }
+          Write-Host "  [OK] External non-HTTP listener remains alive and untouched."
+
+          # Clean up
+          Stop-Process -Id $nonHttpProc.Id -Force -ErrorAction SilentlyContinue
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$rustNonHttpPort/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:$rustNonHttpPort"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $rustNonHttp.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "12. Negative Test: Blackhole Timeout (Hangs on Connection)"
+          Write-Host "================================================================="
+          $blackholePort = 9546
+          $rustBlackholePort = 9746
+          $pyBlackholeCode = @"
+import socket, sys, time
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('127.0.0.1', $blackholePort))
+s.listen(5)
+print('LISTENING')
+sys.stdout.flush()
+while True:
+    try:
+        conn, addr = s.accept()
+        time.sleep(10)
+        conn.close()
+    except:
+        break
+"@
+          $blackholePyFile = Join-Path $env:RUNNER_TEMP "mock_blackhole.py"
+          Set-Content -Path $blackholePyFile -Value $pyBlackholeCode -Encoding utf8
+          $blackholeProc = Start-Process python -ArgumentList @($blackholePyFile) -PassThru
+          Start-Sleep -Seconds 1
+
+          $rustBlackhole = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$pkgRoot", "--port", "$rustBlackholePort", "--backend-port", "$blackholePort", "--no-backend", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 3
+
+          # Health must report backendReady: false with timeout diagnostic
+          $healthBlackhole = Invoke-RestMethod -Uri "http://127.0.0.1:$rustBlackholePort/studio/health" -TimeoutSec 5 -ErrorAction Stop
+          Write-Host "  Blackhole health: backendReady=$($healthBlackhole.backendReady), status=$($healthBlackhole.localStatus)"
+          if ($healthBlackhole.backendReady -ne $false) {
+            throw "Expected backendReady: false for blackhole backend port!"
+          }
+          if ($healthBlackhole.localStatus -notlike "*请求超时*" -and $healthBlackhole.localStatus -notlike "*超时*") {
+            throw "Expected timeout diagnostic message, got: $($healthBlackhole.localStatus)"
+          }
+
+          # API must be blocked with 503
+          $apiBlackhole = Get-HttpStatusAndBody "http://127.0.0.1:$rustBlackholePort/api/status"
+          if ($apiBlackhole.StatusCode -ne 503) {
+            throw "Expected HTTP 503 for blackhole backend, got $($apiBlackhole.StatusCode)"
+          }
+          Write-Host "  [OK] /api/status blocked with HTTP 503 on blackhole listener."
+
+          # External listener must STILL be alive
+          if ($blackholeProc.HasExited) {
+            throw "External blackhole listener process was killed!"
+          }
+          Write-Host "  [OK] External blackhole listener remains alive and untouched."
+
+          # Clean up
+          Stop-Process -Id $blackholeProc.Id -Force -ErrorAction SilentlyContinue
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$rustBlackholePort/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:$rustBlackholePort"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $rustBlackhole.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "13. Negative Test: Child Premature Exit & Cleanup"
+          Write-Host "================================================================="
+          $earlyExitRoot = Join-Path $env:RUNNER_TEMP "child-early-exit-root"
+          $earlyNbl = Join-Path $earlyExitRoot "nbl"
+          $earlyNode = Join-Path $earlyExitRoot "runtime\node"
+          New-Item -ItemType Directory -Force -Path $earlyNbl | Out-Null
+          New-Item -ItemType Directory -Force -Path $earlyNode | Out-Null
+          Copy-Item $systemNode -Destination "$earlyNode\node.exe" -Force
+          Copy-Item "package.json" "$earlyNbl\package.json" -Force
+          Copy-Item "config.json" "$earlyNbl\config.json" -Force
+          Set-Content -Path (Join-Path $earlyNbl "server.mjs") -Value "console.error('Fatal crash on startup'); process.exit(42);" -Encoding utf8
+
+          $earlyExitPort = 9747
+          $earlyBackendPort = 9547
+          $rustEarlyExit = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$earlyExitRoot", "--port", "$earlyExitPort", "--backend-port", "$earlyBackendPort", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 3
+
+          $healthEarlyExit = Invoke-RestMethod -Uri "http://127.0.0.1:$earlyExitPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Early exit health: backendReady=$($healthEarlyExit.backendReady), status=$($healthEarlyExit.localStatus)"
+          if ($healthEarlyExit.backendReady -ne $false) {
+            throw "Expected backendReady: false when child exited prematurely!"
+          }
+          if ($healthEarlyExit.localStatus -notlike "*启动后异常退出*") {
+            throw "Expected '启动后异常退出' in localStatus, got: $($healthEarlyExit.localStatus)"
+          }
+
+          # Verify PID file was cleaned up
+          $earlyPidFile = Join-Path $earlyExitRoot "data\local-server.pid.json"
+          if (Test-Path $earlyPidFile) {
+            throw "PID file was not cleaned up after child early exit!"
+          }
+          Write-Host "  [OK] Child early exit handled, PID file cleaned up, health reports failure."
+
+          # Clean up
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$earlyExitPort/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:$earlyExitPort"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $rustEarlyExit.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "14. Negative Test: Foreign Root Occupancy & Competitor Port Race"
+          Write-Host "================================================================="
+          $competitorPort = 9548
+          $rustCompetitorPort = 9748
+          # Start a mock backend on $competitorPort with foreign root
+          $pyCompetitorCode = @"
+from http.server import HTTPServer, BaseHTTPRequestHandler
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('X-JEU-Studio-Root', 'C:\\Other\\ForeignRoot')
+        self.end_headers()
+        self.wfile.write(b'{\"status\":\"ready\"}')
+    def log_message(self, format, *args): pass
+s = HTTPServer(('127.0.0.1', $competitorPort), H)
+s.serve_forever()
+"@
+          $competitorPyFile = Join-Path $env:RUNNER_TEMP "mock_competitor.py"
+          Set-Content -Path $competitorPyFile -Value $pyCompetitorCode -Encoding utf8
+          $competitorProc = Start-Process python -ArgumentList @($competitorPyFile) -PassThru
+          Start-Sleep -Seconds 1
+
+          $rustCompetitor = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$pkgRoot", "--port", "$rustCompetitorPort", "--backend-port", "$competitorPort", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 2
+
+          # Verify Rust UI refuses to reuse foreign backend
+          $healthCompetitor = Invoke-RestMethod -Uri "http://127.0.0.1:$rustCompetitorPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Competitor health: backendReady=$($healthCompetitor.backendReady), status=$($healthCompetitor.localStatus)"
+          if ($healthCompetitor.backendReady -ne $false) {
+            throw "Expected backendReady: false when port is occupied by foreign root competitor!"
+          }
+          if ($healthCompetitor.localStatus -notlike "*另一目录*") {
+            throw "Expected '另一目录' in localStatus, got: $($healthCompetitor.localStatus)"
+          }
+
+          # Competitor process must NOT be killed
+          if ($competitorProc.HasExited) {
+            throw "Competitor process was killed by Rust UI!"
+          }
+          Write-Host "  [OK] Competitor process remains alive, Rust UI refused to hijack or kill."
+
+          # Clean up
+          Stop-Process -Id $competitorProc.Id -Force -ErrorAction SilentlyContinue
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$rustCompetitorPort/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:$rustCompetitorPort"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $rustCompetitor.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "All Windows CI integration tests passed successfully!"
+          Write-Host "================================================================="
           $global:LASTEXITCODE = 0
           exit 0
