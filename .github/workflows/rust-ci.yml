@@ -43,6 +43,15 @@ jobs:
             throw "Checkout mismatch! Checked out $checkedOutSha but expected $expectedSha"
           }
 
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Node Dependencies
+        run: |
+          npm ci --ignore-scripts
+
       - name: Setup Rust Stable Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -115,7 +124,7 @@ jobs:
 
           Write-Host "1. Launching jeu-studio-native.exe on 127.0.0.1:$testPort with injected backend port $backendPort..."
           $proc = Start-Process -FilePath $exePath `
-            -ArgumentList "--port", "$testPort", "--backend-port", "$backendPort", "--no-open", "--root", "$testRoot" `
+            -ArgumentList "--port", "$testPort", "--backend-port", "$backendPort", "--no-backend", "--no-open", "--root", "$testRoot" `
             -PassThru
 
           Write-Host "  Started PID: $($proc.Id)"
@@ -403,3 +412,333 @@ jobs:
           }
           Write-Host "  [OK] Verified zero files/directories written to test root."
 
+      - name: Live Backend Lifecycle, Packaged Node, Same-Root Reuse, Foreign Rejection & Data Canary
+        run: |
+          $exePath = (Resolve-Path "rust/target/x86_64-pc-windows-msvc/release/jeu-studio-native.exe").Path
+
+          function Get-HttpStatusAndBody($uri, $headers = @{}, $method = "GET") {
+            try {
+              $r = Invoke-WebRequest -Uri $uri -Method $method -Headers $headers -SkipHttpErrorCheck -TimeoutSec 3
+              return @{ StatusCode = [int]$r.StatusCode; Content = $r.Content; Headers = $r.Headers }
+            } catch {
+              $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode.value__ } else { 0 }
+              $body = ""
+              if ($_.Exception.Response) {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                  $reader = New-Object System.IO.StreamReader($stream)
+                  $body = $reader.ReadToEnd()
+                }
+              }
+              return @{ StatusCode = $code; Content = $body; Headers = @{} }
+            }
+          }
+
+          Write-Host "================================================================="
+          Write-Host "1. Testing Packaged Mode Missing Bundled Node Rejection"
+          Write-Host "================================================================="
+          $noNodeRoot = Join-Path $env:RUNNER_TEMP "pkg-missing-node"
+          New-Item -ItemType Directory -Force -Path (Join-Path $noNodeRoot "nbl") | Out-Null
+          Set-Content -Path (Join-Path $noNodeRoot "nbl\server.mjs") -Value "// stub" -Encoding utf8
+
+          $noNodeProc = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$noNodeRoot", "--port", "9743", "--backend-port", "9543", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 2
+
+          $noNodeHealth = Invoke-RestMethod -Uri "http://127.0.0.1:9743/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Health status: backendReady=$($noNodeHealth.backendReady), status=$($noNodeHealth.localStatus)"
+          if ($noNodeHealth.backendReady -ne $false) {
+            Stop-Process -Id $noNodeProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected backendReady: false when bundled node is missing in packaged mode!"
+          }
+          if ($noNodeHealth.localStatus -notlike "*打包模式缺少内置 Node.js 运行时*" -or $noNodeHealth.localStatus -notlike "*禁止回退系统 Node*") {
+            Stop-Process -Id $noNodeProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected missing bundled node error message, got: $($noNodeHealth.localStatus)"
+          }
+          Write-Host "  [OK] Missing bundled node correctly rejected without falling back to system node."
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:9743/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:9743"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $noNodeProc.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "2. Preparing Clean Packaged Installation Layout & Data Canaries"
+          Write-Host "================================================================="
+          $pkgRoot = Join-Path $env:RUNNER_TEMP "pkg-install"
+          $nblDir = Join-Path $pkgRoot "nbl"
+          $runtimeNodeDir = Join-Path $pkgRoot "runtime\node"
+          $dataDir = Join-Path $pkgRoot "data"
+          $sessionsDir = Join-Path $pkgRoot "sessions"
+          $profileDir = Join-Path $sessionsDir "chrome-profile"
+          $outputsDir = Join-Path $pkgRoot "outputs"
+
+          New-Item -ItemType Directory -Force -Path $nblDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $runtimeNodeDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $dataDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $profileDir | Out-Null
+          New-Item -ItemType Directory -Force -Path $outputsDir | Out-Null
+
+          # Copy Node runtime into packaged location
+          $systemNode = (Get-Command node).Source
+          Write-Host "  Copying bundled Node from $systemNode to $runtimeNodeDir\node.exe..."
+          Copy-Item $systemNode -Destination "$runtimeNodeDir\node.exe" -Force
+
+          # Copy backend source & dependencies into nbl\
+          Write-Host "  Copying server scripts & node_modules into $nblDir..."
+          Copy-Item "server.mjs" "$nblDir\server.mjs" -Force
+          Copy-Item "package.json" "$nblDir\package.json" -Force
+          Copy-Item "config.json" "$nblDir\config.json" -Force
+          Get-ChildItem -Filter "*.mjs" | ForEach-Object { Copy-Item $_.FullName "$nblDir\$($_.Name)" -Force }
+          if (Test-Path "public") {
+            robocopy "public" "$nblDir\public" /E /NFL /NDL /NJH /NJS | Out-Null
+          }
+          if (Test-Path "node_modules") {
+            robocopy "node_modules" "$nblDir\node_modules" /E /NFL /NDL /NJH /NJS | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "Robocopy node_modules failed with code $LASTEXITCODE" }
+          }
+
+          # Setup Data Canary files with known contents
+          $canaryCfgPath = Join-Path $dataDir "config.json"
+          $canaryWebcfgPath = Join-Path $dataDir "webconfig.json"
+          $canarySessionPath = Join-Path $sessionsDir "session.json"
+          $canaryCookiePath = Join-Path $profileDir "Cookies"
+          $canaryOutputPath = Join-Path $outputsDir "sample-podcast.mp3"
+
+          Set-Content -Path $canaryCfgPath -Value '{"port": 9540, "canaryActive": true, "userSecretToken": "SECRET_CANARY_VALUE_999"}' -Encoding utf8
+          Set-Content -Path $canaryWebcfgPath -Value '{"passwordHash": "argon2id$canary$webcfg$userhash", "salt": "canary_salt_abc"}' -Encoding utf8
+          Set-Content -Path $canarySessionPath -Value '{"sessionToken": "CANARY_SESSION_TOKEN_12345", "accounts": ["canary@test.local"]}' -Encoding utf8
+          Set-Content -Path $canaryCookiePath -Value 'CANARY_ENCRYPTED_COOKIE_BLOB_BYTE_FOR_BYTE_RETENTION' -Encoding utf8
+          Set-Content -Path $canaryOutputPath -Value 'CANARY_AUDIO_OUTPUT_MP3_STREAM_RETENTION' -Encoding utf8
+
+          $hashCfgBefore = (Get-FileHash $canaryCfgPath -Algorithm SHA256).Hash
+          $hashWebcfgBefore = (Get-FileHash $canaryWebcfgPath -Algorithm SHA256).Hash
+          $hashSessionBefore = (Get-FileHash $canarySessionPath -Algorithm SHA256).Hash
+          $hashCookieBefore = (Get-FileHash $canaryCookiePath -Algorithm SHA256).Hash
+          $hashOutputBefore = (Get-FileHash $canaryOutputPath -Algorithm SHA256).Hash
+
+          Write-Host "  Canary Hashes before startup:"
+          Write-Host "    config.json:            $hashCfgBefore"
+          Write-Host "    webconfig.json:         $hashWebcfgBefore"
+          Write-Host "    sessions/session.json:  $hashSessionBefore"
+          Write-Host "    chrome-profile/Cookies: $hashCookieBefore"
+          Write-Host "    outputs/sample.mp3:     $hashOutputBefore"
+
+          Write-Host "================================================================="
+          Write-Host "3. Spawning Rust UI with isolated PATH and Auto-Starting Backend"
+          Write-Host "================================================================="
+          $rustPort = 9740
+          $backendPort = 9540
+
+          Write-Host "  Launching jeu-studio-native.exe on 127.0.0.1:$rustPort (backend port $backendPort)..."
+          $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+          $startInfo.FileName = $exePath
+          $startInfo.Arguments = "--root `"$pkgRoot`" --port $rustPort --backend-port $backendPort --no-open"
+          $startInfo.Environment["PATH"] = "C:\Windows\System32;C:\Windows"
+          $startInfo.UseShellExecute = $false
+          $rustProc = [System.Diagnostics.Process]::Start($startInfo)
+
+          Write-Host "  Rust UI PID: $($rustProc.Id)"
+
+          Write-Host "  Waiting for backend auto-spawn and binding on port $backendPort..."
+          $ready = $false
+          $healthData = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 500
+            try {
+              $healthData = Invoke-RestMethod -Uri "http://127.0.0.1:$rustPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+              if ($healthData.ok -eq $true -and $healthData.backendReady -eq $true) {
+                $ready = $true
+                break
+              }
+            } catch {
+              # wait and retry
+            }
+          }
+
+          if (-not $ready) {
+            $logPath = Join-Path $dataDir "local-server.log"
+            $logContent = if (Test-Path $logPath) { Get-Content $logPath -Raw } else { "No log file found" }
+            Stop-Process -Id $rustProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Backend failed to become ready within 15 seconds! Health: $($healthData | ConvertTo-Json -Compress). Log: $logContent"
+          }
+          Write-Host "  [OK] /studio/health reports backendReady: true, localStatus: $($healthData.localStatus)"
+
+          Write-Host "================================================================="
+          Write-Host "4. Verifying PID File Contract & STOP_LOCAL.ps1 Compatibility"
+          Write-Host "================================================================="
+          $pidFile = Join-Path $dataDir "local-server.pid.json"
+          if (-not (Test-Path $pidFile)) {
+            Stop-Process -Id $rustProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected PID file $pidFile does not exist!"
+          }
+          $pidContent = Get-Content $pidFile -Raw
+          Write-Host "  PID file content: $pidContent"
+          $pidJson = $pidContent | ConvertFrom-Json
+          $backendPid = [int]$pidJson.pid
+          if ($backendPid -le 0) {
+            throw "Invalid PID in PID file: $backendPid"
+          }
+          if ($pidJson.script -notlike "*nbl\server.mjs*") {
+            throw "Script in PID file does not point to nbl\server.mjs: $($pidJson.script)"
+          }
+          $startedTime = [DateTime]::Parse($pidJson.startedAt).ToUniversalTime()
+          Write-Host "  Parsed startedAt: $($startedTime.ToString('o'))"
+
+          $nodeProc = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
+          if (-not $nodeProc -or $nodeProc.HasExited) {
+            throw "Backend process PID $backendPid is not running!"
+          }
+          Write-Host "  [OK] Backend Node process PID $backendPid is running ($($nodeProc.ProcessName))."
+
+          Write-Host "================================================================="
+          Write-Host "5. Verifying Unauthenticated 401 Passthrough with Ownership Header"
+          Write-Host "================================================================="
+          $apiResp = Get-HttpStatusAndBody "http://127.0.0.1:$rustPort/api/status"
+          if ($apiResp.StatusCode -ne 401) {
+            throw "Expected HTTP 401 Unauthorized from /api/status, got $($apiResp.StatusCode)"
+          }
+          $headerRoot = $apiResp.Headers["X-JEU-Studio-Root"]
+          if ($headerRoot.TrimEnd('\/').ToLower() -ne $pkgRoot.TrimEnd('\/').ToLower()) {
+            throw "Mismatched X-JEU-Studio-Root: expected $pkgRoot, got $headerRoot"
+          }
+          if ($apiResp.Content -notlike "*authenticated*") {
+            throw "Expected JSON auth payload in 401 response: $($apiResp.Content)"
+          }
+          Write-Host "  [OK] /api/status passed through 401 with matching X-JEU-Studio-Root: $headerRoot"
+
+          Write-Host "================================================================="
+          Write-Host "6. Verifying Data Canary Preservation (Zero Overwrite / Truncation)"
+          Write-Host "================================================================="
+          $hashCfgAfter = (Get-FileHash $canaryCfgPath -Algorithm SHA256).Hash
+          $hashWebcfgAfter = (Get-FileHash $canaryWebcfgPath -Algorithm SHA256).Hash
+          $hashSessionAfter = (Get-FileHash $canarySessionPath -Algorithm SHA256).Hash
+          $hashCookieAfter = (Get-FileHash $canaryCookiePath -Algorithm SHA256).Hash
+          $hashOutputAfter = (Get-FileHash $canaryOutputPath -Algorithm SHA256).Hash
+
+          if ($hashCfgAfter -ne $hashCfgBefore) {
+            throw "Data Canary Violation: data/config.json was modified! Before: $hashCfgBefore, After: $hashCfgAfter"
+          }
+          if ($hashWebcfgAfter -ne $hashWebcfgBefore) {
+            throw "Data Canary Violation: data/webconfig.json was modified! Before: $hashWebcfgBefore, After: $hashWebcfgAfter"
+          }
+          if ($hashSessionAfter -ne $hashSessionBefore) {
+            throw "Data Canary Violation: sessions/session.json was modified! Before: $hashSessionBefore, After: $hashSessionAfter"
+          }
+          if ($hashCookieAfter -ne $hashCookieBefore) {
+            throw "Data Canary Violation: sessions/chrome-profile/Cookies was modified! Before: $hashCookieBefore, After: $hashCookieAfter"
+          }
+          if ($hashOutputAfter -ne $hashOutputBefore) {
+            throw "Data Canary Violation: outputs/sample.mp3 was modified! Before: $hashOutputBefore, After: $hashOutputAfter"
+          }
+          Write-Host "  [OK] All 5 data canary files preserved byte-for-byte with identical SHA256."
+
+          Write-Host "================================================================="
+          Write-Host "7. Verifying Same-Directory Backend Reuse (Zero Duplicate Process)"
+          Write-Host "================================================================="
+          $rustProc2 = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$pkgRoot", "--port", "9741", "--backend-port", "$backendPort", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 2
+
+          $health2 = Invoke-RestMethod -Uri "http://127.0.0.1:9741/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Second instance health: backendReady=$($health2.backendReady), status=$($health2.localStatus)"
+          if ($health2.backendReady -ne $true -or $health2.localStatus -notlike "*现有本机 NBL 服务已运行*") {
+            Stop-Process -Id $rustProc2.Id -Force -ErrorAction SilentlyContinue
+            throw "Second instance failed to reuse existing backend!"
+          }
+
+          # Verify no second node process was spawned
+          $allNodeProcs = Get-Process -Name "node" -ErrorAction SilentlyContinue
+          Write-Host "  Total Node processes active: $($allNodeProcs.Count)"
+          $matchingNodeProcs = @($allNodeProcs | Where-Object { $_.Id -eq $backendPid })
+          if ($matchingNodeProcs.Count -ne 1) {
+            Stop-Process -Id $rustProc2.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected exactly 1 Node process with PID $backendPid, found $($matchingNodeProcs.Count)!"
+          }
+          Write-Host "  [OK] Reused existing backend PID $backendPid without spawning duplicate process."
+
+          # Cleanly exit second instance
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:9741/studio/exit" `
+            -Headers @{ "Origin" = "http://127.0.0.1:9741"; "X-JEU-Action" = "quit" } `
+            -TimeoutSec 3 | Out-Null
+          $rustProc2.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "8. Verifying Foreign Directory Rejection & 503 Interception"
+          Write-Host "================================================================="
+          $foreignRoot = Join-Path $env:RUNNER_TEMP "foreign-install"
+          New-Item -ItemType Directory -Force -Path $foreignRoot | Out-Null
+
+          $rustProc3 = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$foreignRoot", "--port", "9742", "--backend-port", "$backendPort", "--no-backend", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 2
+
+          $foreignHealth = Invoke-RestMethod -Uri "http://127.0.0.1:9742/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Foreign instance health: backendReady=$($foreignHealth.backendReady), status=$($foreignHealth.localStatus)"
+          if ($foreignHealth.backendReady -ne $false) {
+            Stop-Process -Id $rustProc3.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign root should report backendReady: false!"
+          }
+          if ($foreignHealth.localStatus -notlike "*另一目录*") {
+            Stop-Process -Id $rustProc3.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected '另一目录' in foreign localStatus, got: $($foreignHealth.localStatus)"
+          }
+
+          # Probing /api/status through foreign instance should return 503
+          $foreignApi = Get-HttpStatusAndBody "http://127.0.0.1:9742/api/status"
+          if ($foreignApi.StatusCode -ne 503) {
+            Stop-Process -Id $rustProc3.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected HTTP 503 for foreign root API request, got $($foreignApi.StatusCode)"
+          }
+          Write-Host "  [OK] Foreign instance blocked /api/status with HTTP 503."
+
+          # Verify original backend was NOT killed
+          $nodeStillAlive = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
+          if (-not $nodeStillAlive -or $nodeStillAlive.HasExited) {
+            Stop-Process -Id $rustProc3.Id -Force -ErrorAction SilentlyContinue
+            throw "Backend PID $backendPid was killed by foreign instance!"
+          }
+          Write-Host "  [OK] Original backend PID $backendPid remained alive and untouched."
+
+          # Exit third instance
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:9742/studio/exit" `
+            -Headers @{ "Origin" = "http://127.0.0.1:9742"; "X-JEU-Action" = "quit" } `
+            -TimeoutSec 3 | Out-Null
+          $rustProc3.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "9. Verifying /studio/exit Leaves Backend Node Service Running"
+          Write-Host "================================================================="
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$rustPort/studio/exit" `
+            -Headers @{ "Origin" = "http://127.0.0.1:$rustPort"; "X-JEU-Action" = "quit" } `
+            -TimeoutSec 3 | Out-Null
+
+          $rustExited = $rustProc.WaitForExit(5000)
+          if (-not $rustExited) {
+            Stop-Process -Id $rustProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Rust UI process did not exit within 5 seconds!"
+          }
+          Write-Host "  [OK] Rust UI process exited with code $($rustProc.ExitCode)."
+
+          # Backend Node process must STILL be running!
+          $nodeRunningAfterExit = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
+          if (-not $nodeRunningAfterExit -or $nodeRunningAfterExit.HasExited) {
+            throw "Backend Node process died after Rust UI exit!"
+          }
+          Write-Host "  [OK] Backend Node process PID $backendPid is STILL RUNNING as background service."
+          if (-not (Test-Path $pidFile)) {
+            throw "PID file was deleted after normal Rust UI exit!"
+          }
+          Write-Host "  [OK] PID file $pidFile preserved."
+
+          Write-Host "================================================================="
+          Write-Host "10. Precise Process Cleanup by Recorded PID"
+          Write-Host "================================================================="
+          Stop-Process -Id $backendPid -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Milliseconds 500
+          $nodeDead = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
+          if ($nodeDead) {
+            throw "Failed to stop backend PID $backendPid!"
+          }
+          Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
+          Write-Host "  [OK] Backend process PID $backendPid precisely cleaned up."
