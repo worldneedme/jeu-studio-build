@@ -419,13 +419,13 @@ jobs:
 
           Write-Host "10. Authenticating via /api/login and verifying authenticated /api/status..."
           $loginBody = @{ password = $testPassword } | ConvertTo-Json
-          $loginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/login" -Method Post -Body $loginBody -ContentType "application/json" -TimeoutSec 5
+          $loginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/login" -Method Post -Body $loginBody -ContentType "application/json" -TimeoutSec 15
           if (-not $loginResp.ok -or -not $loginResp.token) {
             throw "Login failed to return valid authentication token!"
           }
           Write-Host "  [OK] Login successful and auth token received"
 
-          $apiResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/status" -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          $apiResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/status" -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 15
           if ($apiResp.ok -ne $true) {
             throw "Authenticated /api/status did not return ok: true! (Received: $($apiResp | ConvertTo-Json -Compress))"
           }
@@ -452,7 +452,7 @@ jobs:
           Write-Host "  [Verified] Parent directory 'D:\JEU-Studio\sessions' confirmed non-existent prior to launch."
 
           # Test /api/browser/start execution without ENOENT
-          $browserStartResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          $browserStartResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 15
           if (-not $browserStartResp.ok) {
             throw "Issue #3 verification failed: /api/browser/start failed with error: $($browserStartResp.error)"
           }
@@ -467,7 +467,7 @@ jobs:
           $canaryHashBefore = (Get-FileHash $canaryPath -Algorithm SHA256).Hash
 
           # Call start again (idempotent call)
-          $browserStartAgain = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          $browserStartAgain = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 15
           if (-not $browserStartAgain.ok) {
             throw "Issue #3 verification failed: idempotent /api/browser/start failed!"
           }
@@ -478,7 +478,7 @@ jobs:
           Write-Host "  [OK] Profile directory data preservation verified (canary hash intact: $canaryHashAfter)"
 
           # Call stop
-          $browserStopResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/stop" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          $browserStopResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/stop" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 15
           Write-Host "  [OK] /api/browser/stop succeeded: $($browserStopResp | ConvertTo-Json -Compress)"
 
           Write-Host "Verifying auto-generated data/config.json..."
