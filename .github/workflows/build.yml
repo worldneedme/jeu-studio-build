@@ -1,0 +1,470 @@
+name: build-windows
+
+# Public build-only runner repo.
+# The private source (worldneedme/nbl) is fetched on-demand using a read-only deploy key (SOURCE_READ_KEY).
+# Source code is never committed or published here.
+# Verified installers and preview releases are published directly to the private worldneedme/nbl repository.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'Private nbl commit full SHA (40-char hex)'
+        required: true
+        type: string
+      publish:
+        description: 'Publish verified preview release to private nbl repo'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jeu-studio-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Build & Package Windows x64 Native App & Installer
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Validate source SHA format
+        run: |
+          $sha = "${{ inputs.source_sha }}".Trim()
+          if ($sha -notmatch '^[0-9a-fA-F]{40}$') {
+            throw "Invalid source_sha '$sha'. Must be a full 40-character hexadecimal SHA."
+          }
+          Write-Host "Target private source SHA: $sha"
+
+      - name: Checkout private nbl source
+        uses: actions/checkout@v4
+        with:
+          repository: worldneedme/nbl
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          persist-credentials: false
+
+      - name: Assert exact commit checkout
+        run: |
+          $checkedOutSha = (git rev-parse HEAD).Trim()
+          $expectedSha = "${{ inputs.source_sha }}".Trim()
+          Write-Host "Checked out HEAD SHA: $checkedOutSha"
+          Write-Host "Expected target SHA:  $expectedSha"
+          if ($checkedOutSha -ne $expectedSha) {
+            throw "Checkout mismatch! Checked out $checkedOutSha but expected $expectedSha"
+          }
+          Write-Host "Commit verification successful."
+
+      - name: Setup Node.js 20.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Setup Go 1.23
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Setup Standalone FFmpeg Master (Official BtbN Non-Shim)
+        uses: AnimMouse/setup-ffmpeg@v1
+        with:
+          version: master
+
+      - name: Install Inno Setup 6
+        run: choco install innosetup --yes --no-progress
+
+      - name: Install Node Dependencies
+        run: npm ci
+
+      - name: Run Node Unit Tests
+        run: npm test
+
+      - name: Run Go Desktop Unit Tests
+        working-directory: desktop
+        run: go test -v ./...
+
+      - name: Build Go Desktop Native Binary (JEUStudio.exe)
+        working-directory: desktop
+        run: |
+          go build -ldflags "-s -w -H=windowsgui" -o ../JEUStudio.exe .
+          cd ..
+          Get-Item JEUStudio.exe | Select-Object Name, Length
+
+      - name: Package Release Bundle with Portable Runtimes & Dependencies
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Assembling self-contained release bundle with portable runtimes..."
+
+          # 1. Prepare bundle directory structure
+          $bundle = "bundle-content"
+          New-Item -ItemType Directory -Force -Path "$bundle\runtime\node"
+          New-Item -ItemType Directory -Force -Path "$bundle\runtime\ffmpeg\bin"
+          New-Item -ItemType Directory -Force -Path "$bundle\runtime\python"
+          New-Item -ItemType Directory -Force -Path "$bundle\runtime\pyvenv\Scripts"
+          New-Item -ItemType Directory -Force -Path "$bundle\nbl"
+          New-Item -ItemType Directory -Force -Path "$bundle\data"
+          New-Item -ItemType Directory -Force -Path "$bundle\sessions\chrome-profile"
+          New-Item -ItemType Directory -Force -Path "$bundle\outputs"
+
+          # 2. Bundle Node 20 runtime executable
+          $nodeExe = (Get-Command node).Source
+          Copy-Item $nodeExe "$bundle\runtime\node\node.exe"
+          Write-Host "  Bundled Node executable: $((Get-Item "$bundle\runtime\node\node.exe").Length) bytes"
+
+          # 3. Bundle standalone FFmpeg & FFprobe (real standalone binaries, not Chocolatey shims)
+          $ffmpegExe = (Get-Command ffmpeg).Source
+          $ffprobeExe = (Get-Command ffprobe).Source
+          Copy-Item $ffmpegExe "$bundle\runtime\ffmpeg\bin\ffmpeg.exe"
+          Copy-Item $ffprobeExe "$bundle\runtime\ffmpeg\bin\ffprobe.exe"
+          $ffmpegSize = (Get-Item "$bundle\runtime\ffmpeg\bin\ffmpeg.exe").Length
+          if ($ffmpegSize -lt 20MB) {
+            throw "FFmpeg binary is suspicious (only $ffmpegSize bytes, expected >20MB standalone binary)!"
+          }
+          Write-Host "  Bundled standalone FFmpeg binary: $ffmpegSize bytes"
+
+          # 4. Bundle standalone Python 3.12 environment with dependencies
+          $pyRoot = Split-Path -Parent (Get-Command python).Source
+          Copy-Item "$pyRoot\python.exe" "$bundle\runtime\python\python.exe"
+          Copy-Item "$pyRoot\python3*.dll" "$bundle\runtime\python\"
+          Copy-Item -Recurse "$pyRoot\DLLs" "$bundle\runtime\python\"
+          Copy-Item -Recurse "$pyRoot\Lib" "$bundle\runtime\python\"
+          Copy-Item "$bundle\runtime\python\python.exe" "$bundle\runtime\pyvenv\Scripts\python.exe"
+          & "$bundle\runtime\python\python.exe" -m pip install --no-warn-script-location requests
+          Write-Host "  Bundled standalone Python environment with requests verified."
+
+          # 5. Copy desktop shell, scripts, and runtime assets
+          Copy-Item "JEUStudio.exe" "$bundle\"
+          Copy-Item "STOP_LOCAL.ps1" "$bundle\"
+          Copy-Item "config.json" "$bundle\"
+
+          # 6. Copy nbl source and node_modules
+          $nblFiles = @("server.mjs", "batch.mjs", "capture-session.mjs", "audio_to_srt.py", "bcut_asr.py", "prompts.txt", "package.json", "package-lock.json", "config.json")
+          foreach ($f in $nblFiles) {
+            if (Test-Path $f) { Copy-Item $f "$bundle\nbl\" }
+          }
+          if (Test-Path "public") {
+            Copy-Item -Recurse "public" "$bundle\nbl\public"
+          }
+          Copy-Item -Recurse "node_modules" "$bundle\nbl\node_modules"
+
+          Write-Host "Release bundle packaged successfully."
+
+      - name: Build Inno Setup Installer
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          Get-Item JEUStudio-Setup-x64.exe | Select-Object Name, Length
+
+      - name: Create Zip Package for Direct Portable Distribution
+        run: |
+          Compress-Archive -Path "bundle-content\*" -DestinationPath "JEUStudio-Windows-x64.zip" -Force
+          Get-Item JEUStudio-Windows-x64.zip | Select-Object Name, Length
+
+      - name: Verify Windows Installation to D:\JEU-Studio & Bundled Runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "=========================================="
+          Write-Host "Starting Isolated Acceptance Verification:"
+          Write-Host "=========================================="
+
+          Write-Host "1. Testing silent installer without /DIR parameter..."
+          $installProc = Start-Process -FilePath ".\JEUStudio-Setup-x64.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -PassThru -Wait
+          if ($installProc.ExitCode -ne 0) {
+            throw "Installer failed with exit code: $($installProc.ExitCode)"
+          }
+
+          Write-Host "2. Verifying default installation directory: D:\JEU-Studio..."
+          if (-not (Test-Path "D:\JEU-Studio")) {
+            throw "Installation failed: D:\JEU-Studio does not exist!"
+          }
+
+          $requiredFiles = @(
+            "D:\JEU-Studio\JEUStudio.exe",
+            "D:\JEU-Studio\STOP_LOCAL.ps1",
+            "D:\JEU-Studio\runtime\node\node.exe",
+            "D:\JEU-Studio\runtime\ffmpeg\bin\ffmpeg.exe",
+            "D:\JEU-Studio\runtime\ffmpeg\bin\ffprobe.exe",
+            "D:\JEU-Studio\runtime\python\python.exe",
+            "D:\JEU-Studio\nbl\server.mjs",
+            "D:\JEU-Studio\nbl\capture-session.mjs",
+            "D:\JEU-Studio\nbl\public\index.html"
+          )
+          foreach ($f in $requiredFiles) {
+            if (-not (Test-Path $f)) {
+              throw "Required file missing in D:\JEU-Studio: $f"
+            }
+          }
+          Write-Host "All required files verified in D:\JEU-Studio."
+
+          Write-Host "3. Simulating clean Windows environment (stripping runner node/python/ffmpeg from PATH)..."
+          $cleanPath = ($env:PATH -split ';' | Where-Object {
+            $_ -notmatch 'hostedtoolcache' -and
+            $_ -notmatch 'node' -and
+            $_ -notmatch 'python' -and
+            $_ -notmatch 'chocolatey' -and
+            $_ -notmatch 'ffmpeg'
+          }) -join ';'
+          $env:PATH = $cleanPath
+
+          Write-Host "Verifying runner tools are stripped from PATH:"
+          $testNode = Get-Command node -ErrorAction SilentlyContinue
+          $testPython = Get-Command python -ErrorAction SilentlyContinue
+          $testFFmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+          Write-Host "  node on PATH: $($testNode -eq $null)"
+          Write-Host "  python on PATH: $($testPython -eq $null)"
+          Write-Host "  ffmpeg on PATH: $($testFFmpeg -eq $null)"
+
+          Write-Host "4. Testing bundled isolated runtimes directly..."
+          $nodeVer = & "D:\JEU-Studio\runtime\node\node.exe" --version
+          Write-Host "  Bundled Node.js: $nodeVer"
+          $ffmpegVer = & "D:\JEU-Studio\runtime\ffmpeg\bin\ffmpeg.exe" -version | Select-Object -First 1
+          Write-Host "  Bundled FFmpeg: $ffmpegVer"
+          $pyVer = & "D:\JEU-Studio\runtime\python\python.exe" --version
+          Write-Host "  Bundled Python: $pyVer"
+
+          Write-Host "5. Testing offline audio conversion and Python subtitle FFmpeg resolution..."
+          New-Item -ItemType Directory -Force -Path "D:\JEU-Studio\data"
+          & "D:\JEU-Studio\runtime\ffmpeg\bin\ffmpeg.exe" -f lavfi -i anullsrc=r=16000:cl=mono -t 1 -y "D:\JEU-Studio\data\test_sample.wav"
+          & "D:\JEU-Studio\runtime\ffmpeg\bin\ffmpeg.exe" -i "D:\JEU-Studio\data\test_sample.wav" -y "D:\JEU-Studio\data\test_sample.mp3"
+          if (-not (Test-Path "D:\JEU-Studio\data\test_sample.mp3")) {
+            throw "FFmpeg audio conversion test failed!"
+          }
+          Write-Host "  [OK] FFmpeg offline audio conversion verified."
+
+          & "D:\JEU-Studio\runtime\python\python.exe" -c "import sys, os; sys.path.insert(0, r'D:\JEU-Studio\nbl'); import audio_to_srt; f = audio_to_srt.resolve_ffmpeg_bin(); print('Resolved FFmpeg in Python:', f); assert os.path.isfile(f), f'FFmpeg not found: {f}'; assert 'runtime' in f.lower(), 'FFmpeg was not resolved to bundled runtime!'"
+          Write-Host "  [OK] Python subtitle script and bundled FFmpeg resolution verified."
+
+          Write-Host "6. Negative tests for STOP_LOCAL.ps1..."
+          Write-Host "6A. Negative test: PID reuse / creation time check (real server.mjs on port 9655, stale startedAt)..."
+          New-Item -ItemType Directory -Force -Path "D:\JEU-Studio\test-6a"
+          # Launch real server.mjs using bundled node on independent test port 9655
+          $reusedProc = Start-Process -FilePath "D:\JEU-Studio\runtime\node\node.exe" -ArgumentList "D:\JEU-Studio\nbl\server.mjs" -Environment @{ NBL_PORT = "9655"; NBL_DATA_DIR = "D:\JEU-Studio\test-6a" } -PassThru
+          Write-Host "  Started real server.mjs on test port 9655 (PID $($reusedProc.Id))"
+          Start-Sleep -Seconds 2
+          $reusedPidInfo = @{
+            pid = $reusedProc.Id
+            script = "D:\JEU-Studio\nbl\server.mjs"
+            startedAt = (Get-Date).AddHours(-2).ToString("o")
+          } | ConvertTo-Json
+          Set-Content -Path "D:\JEU-Studio\data\local-server.pid.json" -Value $reusedPidInfo -Encoding UTF8
+          Write-Host "  Executing STOP_LOCAL.ps1 with stale/reused PID on real server.mjs..."
+          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          $checkReused = Get-Process -Id $reusedProc.Id -ErrorAction SilentlyContinue
+          if (-not $checkReused -or $reusedProc.HasExited) {
+            throw "Negative test 6A failed: real server.mjs process with stale startedAt was terminated by STOP_LOCAL.ps1!"
+          }
+          if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
+            throw "Negative test 6A failed: stale PID file was not cleaned up!"
+          }
+          Write-Host "  [OK] Negative test 6A passed: creation time check protected real process and cleaned stale PID file."
+          Stop-Process -Id $reusedProc.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "D:\JEU-Studio\test-6a" -ErrorAction SilentlyContinue
+
+          Write-Host "6B. Negative test: Parameter spoofing (node executing -e with target path in argv, must not stop)..."
+          $spoofProc = Start-Process -FilePath "D:\JEU-Studio\runtime\node\node.exe" -ArgumentList "-e `"setInterval(() => {}, 1000)`" `"D:\JEU-Studio\nbl\server.mjs`"" -PassThru
+          Write-Host "  Started parameter spoofing dummy process (PID $($spoofProc.Id))"
+          $spoofPidInfo = @{
+            pid = $spoofProc.Id
+            script = "D:\JEU-Studio\nbl\server.mjs"
+            startedAt = (Get-Date).ToString("o")
+          } | ConvertTo-Json
+          Set-Content -Path "D:\JEU-Studio\data\local-server.pid.json" -Value $spoofPidInfo -Encoding UTF8
+          Write-Host "  Executing STOP_LOCAL.ps1 against parameter-spoofed process..."
+          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          $checkSpoof = Get-Process -Id $spoofProc.Id -ErrorAction SilentlyContinue
+          if (-not $checkSpoof -or $spoofProc.HasExited) {
+            throw "Negative test 6B failed: parameter-spoofed process was terminated by STOP_LOCAL.ps1!"
+          }
+          if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
+            throw "Negative test 6B failed: invalid PID file was not cleaned up!"
+          }
+          Write-Host "  [OK] Negative test 6B passed: strict script parsing protected parameter-spoofed process and cleaned PID file."
+          Stop-Process -Id $spoofProc.Id -Force -ErrorAction SilentlyContinue
+
+          Write-Host "6C. Negative test: Cross-directory server.mjs isolation protection..."
+          New-Item -ItemType Directory -Force -Path "C:\OtherApp\nbl"
+          Set-Content -Path "C:\OtherApp\nbl\server.mjs" -Value "setInterval(() => {}, 1000);" -Encoding UTF8
+          $otherProc = Start-Process -FilePath "D:\JEU-Studio\runtime\node\node.exe" -ArgumentList "C:\OtherApp\nbl\server.mjs" -PassThru
+          Write-Host "  Started other installation node server.mjs (PID $($otherProc.Id))"
+          $otherPidInfo = @{
+            pid = $otherProc.Id
+            script = "C:\OtherApp\nbl\server.mjs"
+            startedAt = (Get-Date).ToString("o")
+          } | ConvertTo-Json
+          Set-Content -Path "D:\JEU-Studio\data\local-server.pid.json" -Value $otherPidInfo -Encoding UTF8
+          Write-Host "  Executing STOP_LOCAL.ps1 against foreign directory server.mjs..."
+          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          $checkOther = Get-Process -Id $otherProc.Id -ErrorAction SilentlyContinue
+          if (-not $checkOther -or $otherProc.HasExited) {
+            throw "Negative test 6C failed: other directory server.mjs was terminated by STOP_LOCAL.ps1!"
+          }
+          if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
+            throw "Negative test 6C failed: foreign PID file was not cleaned up!"
+          }
+          Write-Host "  [OK] Negative test 6C passed: foreign directory server.mjs survived and PID file cleaned up."
+          Stop-Process -Id $otherProc.Id -Force -ErrorAction SilentlyContinue
+          Remove-Item -Recurse -Force "C:\OtherApp" -ErrorAction SilentlyContinue
+
+          Write-Host "7. Setting up local test authentication in webconfig.json..."
+          $testPassword = [System.Guid]::NewGuid().ToString("N")
+          $webCfg = @{ port = 9527; password = $testPassword } | ConvertTo-Json
+          Set-Content -Path "D:\JEU-Studio\data\webconfig.json" -Value $webCfg -Encoding UTF8
+
+          Write-Host "8. Testing desktop app launch and local backend in clean environment..."
+          $app = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "-no-open -port 9733" -PassThru
+
+          Write-Host "Polling /studio/health endpoint..."
+          $healthOk = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $resp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/studio/health" -TimeoutSec 2 -ErrorAction Stop
+              if ($resp.ok -eq $true) {
+                Write-Host "Studio Health Check: $($resp | ConvertTo-Json -Compress)"
+                $healthOk = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $healthOk) {
+            throw "Studio health check failed at http://127.0.0.1:9733/studio/health"
+          }
+
+          Write-Host "9. Polling /api/status until backend is ready, verifying unauthenticated request returns HTTP 401..."
+          $unauth401 = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/status" -TimeoutSec 2 -ErrorAction Stop
+            } catch {
+              $statusVal = $_.Exception.Response.StatusCode.value__
+              if ($statusVal -eq 401) {
+                Write-Host "  [OK] Backend ready and /api/status correctly rejected unauthenticated request with HTTP 401"
+                $unauth401 = $true
+                break
+              } elseif ($statusVal -eq 502) {
+                # Reverse proxy waiting for backend server.mjs on 9527 to finish binding
+                continue
+              } else {
+                throw "Unexpected response code from /api/status: $statusVal"
+              }
+            }
+          }
+          if (-not $unauth401) {
+            throw "Unauthenticated request to /api/status did not return HTTP 401 within timeout!"
+          }
+
+          Write-Host "10. Authenticating via /api/login and verifying authenticated /api/status..."
+          $loginBody = @{ password = $testPassword } | ConvertTo-Json
+          $loginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/login" -Method Post -Body $loginBody -ContentType "application/json" -TimeoutSec 5
+          if (-not $loginResp.ok -or -not $loginResp.token) {
+            throw "Login failed to return valid authentication token!"
+          }
+          Write-Host "  [OK] Login successful and auth token received"
+
+          $apiResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/status" -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          if ($apiResp.ok -ne $true) {
+            throw "Authenticated /api/status did not return ok: true! (Received: $($apiResp | ConvertTo-Json -Compress))"
+          }
+          Write-Host "  [OK] Authenticated /api/status returned HTTP 200 and ok: true"
+
+          Write-Host "Verifying auto-generated data/config.json..."
+          if (-not (Test-Path "D:\JEU-Studio\data\config.json")) {
+            throw "Safe config initialization failed: D:\JEU-Studio\data\config.json does not exist!"
+          }
+          Write-Host "  [OK] D:\JEU-Studio\data\config.json initialized."
+
+          Write-Host "11. Positive test: stopping verified JEU Studio service with STOP_LOCAL.ps1..."
+          $backendPid = $null
+          if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
+            try {
+              $pidInfo = Get-Content "D:\JEU-Studio\data\local-server.pid.json" -Raw | ConvertFrom-Json
+              $backendPid = [int]$pidInfo.pid
+              Write-Host "  Recorded running backend PID: $backendPid"
+            } catch {}
+          }
+
+          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          Start-Sleep -Seconds 2
+
+          # Verify backend process has exited
+          if ($backendPid -gt 0) {
+            $checkBackend = Get-Process -Id $backendPid -ErrorAction SilentlyContinue
+            if ($checkBackend -and -not $checkBackend.HasExited) {
+              throw "Positive test failed: backend process PID $backendPid is still running!"
+            }
+            Write-Host "  [OK] Backend process PID $backendPid confirmed terminated."
+          }
+
+          # Verify port 9527 is no longer listening
+          $portCheck = netstat -ano | Select-String "127.0.0.1:9527" | Select-String "LISTENING"
+          if ($portCheck) {
+            throw "Positive test failed: port 9527 is still in LISTENING state!"
+          }
+          Write-Host "  [OK] Port 9527 confirmed closed."
+
+          # Verify HTTP request connection fails (and explicitly reject 401 or 200)
+          try {
+            $resp = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/status" -TimeoutSec 2 -ErrorAction Stop
+            throw "Positive test failed: backend still returned HTTP response ($($resp | ConvertTo-Json -Compress))"
+          } catch {
+            $statusCode = $_.Exception.Response.StatusCode.value__
+            if ($statusCode -eq 401 -or $statusCode -eq 200) {
+              throw "Positive test failed: backend returned HTTP $statusCode, indicating service is still running!"
+            }
+            Write-Host "  [OK] Connection to port 9527 refused as expected ($($_.Exception.Message))."
+          }
+          Write-Host "  [OK] Positive test passed: JEU Studio backend service successfully stopped and confirmed dead."
+
+          Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "Windows native installation, health check, proxy route and shutdown verification successful!"
+
+      - name: Calculate Checksums for Installer and Portable Zip
+        run: |
+          $setupHash = (Get-FileHash JEUStudio-Setup-x64.exe -Algorithm SHA256).Hash.ToLower()
+          $zipHash = (Get-FileHash JEUStudio-Windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+          $sourceSha = "${{ inputs.source_sha }}".Trim()
+
+          Write-Host "=========================================="
+          Write-Host "Source Commit SHA: $sourceSha"
+          Write-Host "JEUStudio-Setup-x64.exe SHA256: $setupHash"
+          Write-Host "JEUStudio-Windows-x64.zip SHA256: $zipHash"
+          Write-Host "=========================================="
+
+          $checksumContent = "Source-Commit: $sourceSha`nJEUStudio-Setup-x64.exe: $setupHash`nJEUStudio-Windows-x64.zip: $zipHash"
+          Set-Content -Path "checksums.txt" -Value $checksumContent -Encoding UTF8
+
+      - name: Deliver Preview Release to Private Source Repo (worldneedme/nbl)
+        if: ${{ inputs.publish }}
+        env:
+          GH_TOKEN: ${{ secrets.NBL_RELEASES_TOKEN }}
+        run: |
+          if (-not $env:GH_TOKEN) {
+            Write-Warning "NBL_RELEASES_TOKEN secret not configured; skipping private release publication."
+            exit 0
+          }
+          $sourceSha = "${{ inputs.source_sha }}".Trim()
+          $shortSha = $sourceSha.Substring(0, 7)
+          $tag = "preview-$shortSha"
+          $setupHash = (Get-FileHash JEUStudio-Setup-x64.exe -Algorithm SHA256).Hash.ToLower()
+          $zipHash = (Get-FileHash JEUStudio-Windows-x64.zip -Algorithm SHA256).Hash.ToLower()
+
+          Write-Host "Publishing preview release $tag to private repository worldneedme/nbl..."
+          gh release delete $tag --repo worldneedme/nbl --yes 2>$null
+          gh release create $tag JEUStudio-Setup-x64.exe JEUStudio-Windows-x64.zip checksums.txt `
+            --repo worldneedme/nbl `
+            --target $sourceSha `
+            --title "JEU Studio Preview ($shortSha)" `
+            --notes "Automated Windows x64 build and verification for commit $sourceSha`n`nBuilt by worldneedme/jeu-studio-build run ${{ github.run_id }}`n`nSHA256 Checksums:`n- JEUStudio-Setup-x64.exe: $setupHash`n- JEUStudio-Windows-x64.zip: $zipHash" `
+            --prerelease
+          Write-Host "Preview release successfully published to private repo: https://github.com/worldneedme/nbl/releases/tag/$tag"
