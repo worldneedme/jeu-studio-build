@@ -705,7 +705,10 @@ jobs:
           }
           $devWebCfg = Get-Content $devWebCfgFile -Raw | ConvertFrom-Json
           $devPassword = $devWebCfg.password
-          Write-Host "  Dev web console password auto-generated successfully."
+          Write-Host "  Dev web console password initialized: $devPassword"
+          if ($devPassword -ne "NBL") {
+            throw "Dev web console password expected to be 'NBL', got '$devPassword'!"
+          }
 
           $devLoginBody = @{ password = $devPassword } | ConvertTo-Json
           $devLoginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/login" -Method Post -Body $devLoginBody -ContentType "application/json" -TimeoutSec 15
@@ -914,6 +917,46 @@ jobs:
             Stop-Process -Id $devProc.Id -Force -ErrorAction SilentlyContinue
           }
           Write-Host "  [OK] Dev repository verification completed successfully and cleanly."
+
+          # 12H. Verify existing webconfig.json password preservation on restart
+          Write-Host "  --- 12H. Verifying existing webconfig.json is preserved and NOT overwritten on restart ---"
+          $customCfg = @{ port = 9527; password = "CUSTOM_SAVED_PWD_888" } | ConvertTo-Json
+          Set-Content -Path $devWebCfgFile -Value $customCfg -Encoding UTF8
+          $customProc = Start-Process -FilePath $devNodeBin -ArgumentList "server.mjs" -WorkingDirectory $devRoot -Environment @{
+            PATH = "D:\JEU-Studio\runtime\node;D:\JEU-Studio\runtime\ffmpeg\bin;$env:SystemRoot\System32"
+            NBL_PORT = "9527"
+            NBL_TEST_BROWSER_STUB = "1"
+          } -PassThru
+          Start-Sleep -Seconds 2
+          $reloadedCfg = Get-Content $devWebCfgFile -Raw | ConvertFrom-Json
+          if ($reloadedCfg.password -ne "CUSTOM_SAVED_PWD_888") {
+            Stop-Process -Id $customProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Existing configuration overwrite test failed: password was changed from 'CUSTOM_SAVED_PWD_888' to '$($reloadedCfg.password)'!"
+          }
+          # Login with NBL must fail (confirming strict verification, no permanent bypass)
+          $nblFailed = $false
+          try {
+            $badLogin = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/login" -Method Post -Body (@{ password = "NBL" } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5
+            if ($badLogin.ok -eq $false) { $nblFailed = $true }
+          } catch {
+            $nblFailed = $true
+          }
+          if (-not $nblFailed) {
+            Stop-Process -Id $customProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Strict verification test failed: login with NBL should fail when custom password is set!"
+          }
+          # Login with custom password must succeed
+          $customLogin = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/login" -Method Post -Body (@{ password = "CUSTOM_SAVED_PWD_888" } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5
+          if (-not $customLogin.ok -or -not $customLogin.token) {
+            Stop-Process -Id $customProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Custom password login failed!"
+          }
+          Write-Host "  [OK] Existing webconfig.json was preserved, custom password verified, and NBL bypass confirmed absent."
+          & "$devRoot\STOP_LOCAL.ps1"
+          Start-Sleep -Seconds 2
+          if (-not $customProc.HasExited) {
+            Stop-Process -Id $customProc.Id -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Calculate Checksums for Installer and Portable Zip
         run: |
