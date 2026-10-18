@@ -54,15 +54,29 @@ jobs:
           Write-Host "Running cargo fmt --check..."
           cargo fmt --check --manifest-path rust/Cargo.toml
 
-      - name: Run Unit & Integration Tests (cargo test)
+      - name: Inspect or Generate Lockfile
+        run: |
+          if (-not (Test-Path "rust/Cargo.lock")) {
+            Write-Host "No rust/Cargo.lock in checkout. Generating lockfile..."
+            cargo generate-lockfile --manifest-path rust/Cargo.toml
+            $bytes = [System.IO.File]::ReadAllBytes("rust/Cargo.lock")
+            $b64 = [Convert]::ToBase64String($bytes)
+            Write-Host "=== CARGO_LOCK_B64_START ==="
+            Write-Host $b64
+            Write-Host "=== CARGO_LOCK_B64_END ==="
+          } else {
+            Write-Host "rust/Cargo.lock found in checkout."
+          }
+
+      - name: Run Unit & Integration Tests (cargo test --locked)
         run: |
           Write-Host "Running cargo test on x86_64-pc-windows-msvc..."
-          cargo test --manifest-path rust/Cargo.toml --target x86_64-pc-windows-msvc -- --nocapture
+          cargo test --locked --manifest-path rust/Cargo.toml --target x86_64-pc-windows-msvc -- --nocapture
 
-      - name: Build Release Binary (cargo build --release)
+      - name: Build Release Binary (cargo build --locked --release)
         run: |
           Write-Host "Compiling release binary..."
-          cargo build --release --manifest-path rust/Cargo.toml --target x86_64-pc-windows-msvc
+          cargo build --locked --release --manifest-path rust/Cargo.toml --target x86_64-pc-windows-msvc
 
       - name: Verify Executable & Compute Checksum
         id: checksum
@@ -172,11 +186,3 @@ jobs:
           Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 1
           Write-Host "  [OK] Smoke test process terminated."
-
-      - name: Upload Non-Public Debug Artifact (Retention 7 days)
-        uses: actions/upload-artifact@v4
-        with:
-          name: jeu-studio-native-windows-x64
-          path: rust/target/x86_64-pc-windows-msvc/release/jeu-studio-native.exe
-          retention-days: 7
-          if-no-files-found: error
