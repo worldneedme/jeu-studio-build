@@ -490,10 +490,13 @@ jobs:
           Get-ChildItem -Filter "*.mjs" | ForEach-Object { Copy-Item $_.FullName "$nblDir\$($_.Name)" -Force }
           if (Test-Path "public") {
             robocopy "public" "$nblDir\public" /E /NFL /NDL /NJH /NJS | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "Robocopy public failed with code $LASTEXITCODE" }
+            $global:LASTEXITCODE = 0
           }
           if (Test-Path "node_modules") {
             robocopy "node_modules" "$nblDir\node_modules" /E /NFL /NDL /NJH /NJS | Out-Null
             if ($LASTEXITCODE -ge 8) { throw "Robocopy node_modules failed with code $LASTEXITCODE" }
+            $global:LASTEXITCODE = 0
           }
 
           # Setup Data Canary files with known contents
@@ -742,3 +745,5 @@ jobs:
           }
           Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
           Write-Host "  [OK] Backend process PID $backendPid precisely cleaned up."
+          $global:LASTEXITCODE = 0
+          exit 0
