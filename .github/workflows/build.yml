@@ -113,8 +113,8 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Write-Host "Assembling self-contained release bundle with portable runtimes..."
 
-          # 1. Prepare bundle directory structure
-          $bundle = "bundle-content"
+          # 1. Prepare package directory structure matching installer.iss
+          $bundle = "package"
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\node"
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\ffmpeg\bin"
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\python"
@@ -165,16 +165,17 @@ jobs:
           }
           Copy-Item -Recurse "node_modules" "$bundle\nbl\node_modules"
 
-          Write-Host "Release bundle packaged successfully."
+          Write-Host "Release bundle packaged successfully into package/."
 
       - name: Build Inno Setup Installer
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+          Move-Item -Path "dist\JEUStudio-Setup-x64.exe" -Destination ".\JEUStudio-Setup-x64.exe" -Force
           Get-Item JEUStudio-Setup-x64.exe | Select-Object Name, Length
 
       - name: Create Zip Package for Direct Portable Distribution
         run: |
-          Compress-Archive -Path "bundle-content\*" -DestinationPath "JEUStudio-Windows-x64.zip" -Force
+          Compress-Archive -Path "package\*" -DestinationPath "JEUStudio-Windows-x64.zip" -Force
           Get-Item JEUStudio-Windows-x64.zip | Select-Object Name, Length
 
       - name: Verify Windows Installation to D:\JEU-Studio & Bundled Runtime
@@ -183,6 +184,13 @@ jobs:
           Write-Host "=========================================="
           Write-Host "Starting Isolated Acceptance Verification:"
           Write-Host "=========================================="
+
+          # Ensure Drive D: is available on GitHub-hosted runner
+          if (-not (Test-Path "D:\")) {
+            Write-Host "Drive D: not mounted, mapping D: via subst..."
+            New-Item -ItemType Directory -Path "$env:RUNNER_TEMP\VirtualDriveD" -Force
+            subst D: "$env:RUNNER_TEMP\VirtualDriveD"
+          }
 
           Write-Host "1. Testing silent installer without /DIR parameter..."
           $installProc = Start-Process -FilePath ".\JEUStudio-Setup-x64.exe" -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" -PassThru -Wait
