@@ -246,6 +246,23 @@ jobs:
           }
           Write-Host "All required files verified in D:\JEU-Studio."
 
+          # Verify STOP_LOCAL.ps1 has UTF-8 BOM required by Windows PowerShell 5.1
+          $stopBytes = [System.IO.File]::ReadAllBytes("D:\JEU-Studio\STOP_LOCAL.ps1")
+          if ($stopBytes.Length -lt 3 -or $stopBytes[0] -ne 0xEF -or $stopBytes[1] -ne 0xBB -or $stopBytes[2] -ne 0xBF) {
+            throw "Verification failed: D:\JEU-Studio\STOP_LOCAL.ps1 is missing UTF-8 BOM!"
+          }
+          Write-Host "  [OK] D:\JEU-Studio\STOP_LOCAL.ps1 verified with UTF-8 BOM."
+
+          $winPs = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
+          if (-not (Test-Path $winPs)) { $winPs = "powershell.exe" }
+          Write-Host "  [OK] Resolved Windows PowerShell 5.1 engine: $winPs"
+
+          & $winPs -NoProfile -Command '$errs = $null; [System.Management.Automation.Language.Parser]::ParseFile("D:\JEU-Studio\STOP_LOCAL.ps1", [ref]$null, [ref]$errs); if ($errs -and $errs.Count -gt 0) { $errs | ForEach-Object { Write-Error $_ }; exit 1 } else { exit 0 }'
+          if ($LASTEXITCODE -ne 0) {
+            throw "AST parser check failed: D:\JEU-Studio\STOP_LOCAL.ps1 contains parser errors under Windows PowerShell 5.1!"
+          }
+          Write-Host "  [OK] Windows PowerShell 5.1 AST parsing verified clean with 0 errors."
+
           Write-Host "3. Simulating clean Windows environment (stripping runner node/python/ffmpeg from PATH)..."
           $cleanPath = ($env:PATH -split ';' | Where-Object {
             $_ -notmatch 'hostedtoolcache' -and
@@ -309,8 +326,11 @@ jobs:
             startedAt = (Get-Date).AddHours(-2).ToString("o")
           } | ConvertTo-Json
           Set-Content -Path "D:\JEU-Studio\data\local-server.pid.json" -Value $reusedPidInfo -Encoding UTF8
-          Write-Host "  Executing STOP_LOCAL.ps1 with stale/reused PID on real server.mjs..."
-          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          Write-Host "  Executing STOP_LOCAL.ps1 with stale/reused PID on real server.mjs using Windows PowerShell 5.1..."
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "D:\JEU-Studio\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Negative test 6A failed: STOP_LOCAL.ps1 exited with code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           $checkReused = Get-Process -Id $reusedProc.Id -ErrorAction SilentlyContinue
           if (-not $checkReused -or $reusedProc.HasExited) {
             throw "Negative test 6A failed: real server.mjs process with stale startedAt was terminated by STOP_LOCAL.ps1!"
@@ -331,8 +351,11 @@ jobs:
             startedAt = (Get-Date).ToString("o")
           } | ConvertTo-Json
           Set-Content -Path "D:\JEU-Studio\data\local-server.pid.json" -Value $spoofPidInfo -Encoding UTF8
-          Write-Host "  Executing STOP_LOCAL.ps1 against parameter-spoofed process..."
-          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          Write-Host "  Executing STOP_LOCAL.ps1 against parameter-spoofed process using Windows PowerShell 5.1..."
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "D:\JEU-Studio\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Negative test 6B failed: STOP_LOCAL.ps1 exited with code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           $checkSpoof = Get-Process -Id $spoofProc.Id -ErrorAction SilentlyContinue
           if (-not $checkSpoof -or $spoofProc.HasExited) {
             throw "Negative test 6B failed: parameter-spoofed process was terminated by STOP_LOCAL.ps1!"
@@ -354,8 +377,11 @@ jobs:
             startedAt = (Get-Date).ToString("o")
           } | ConvertTo-Json
           Set-Content -Path "D:\JEU-Studio\data\local-server.pid.json" -Value $otherPidInfo -Encoding UTF8
-          Write-Host "  Executing STOP_LOCAL.ps1 against foreign directory server.mjs..."
-          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          Write-Host "  Executing STOP_LOCAL.ps1 against foreign directory server.mjs using Windows PowerShell 5.1..."
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "D:\JEU-Studio\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Negative test 6C failed: STOP_LOCAL.ps1 exited with code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           $checkOther = Get-Process -Id $otherProc.Id -ErrorAction SilentlyContinue
           if (-not $checkOther -or $otherProc.HasExited) {
             throw "Negative test 6C failed: other directory server.mjs was terminated by STOP_LOCAL.ps1!"
@@ -487,7 +513,7 @@ jobs:
           }
           Write-Host "  [OK] D:\JEU-Studio\data\config.json initialized."
 
-          Write-Host "11. Positive test: stopping verified JEU Studio service with STOP_LOCAL.ps1..."
+          Write-Host "11. Positive test: stopping verified JEU Studio service with STOP_LOCAL.ps1 using Windows PowerShell 5.1..."
           $backendPid = $null
           if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
             try {
@@ -497,7 +523,10 @@ jobs:
             } catch {}
           }
 
-          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "D:\JEU-Studio\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Positive test failed: STOP_LOCAL.ps1 exited with code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           Start-Sleep -Seconds 2
 
           # Verify backend process has exited
@@ -614,7 +643,10 @@ jobs:
           if (-not $postUpgradeHealthy) {
             throw "Upgrade test failed: replacement JEUStudio.exe did not start successfully."
           }
-          & "D:\JEU-Studio\STOP_LOCAL.ps1"
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "D:\JEU-Studio\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Post-upgrade STOP_LOCAL.ps1 failed with exit code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           Stop-Process -Id $postUpgradeApp.Id -Force -ErrorAction SilentlyContinue
           Write-Host "  [OK] Replacement desktop shell started successfully after upgrade."
 
@@ -630,6 +662,11 @@ jobs:
           # Copy repo files into dev directory (without parent runtime or JEUStudio.exe)
           Copy-Item -Path "D:\JEU-Studio\nbl\*" -Destination $devRoot -Recurse -Force
           Copy-Item -Path "D:\JEU-Studio\STOP_LOCAL.ps1" -Destination $devRoot -Force
+          $devStopBytes = [System.IO.File]::ReadAllBytes("$devRoot\STOP_LOCAL.ps1")
+          if ($devStopBytes.Length -lt 3 -or $devStopBytes[0] -ne 0xEF -or $devStopBytes[1] -ne 0xBB -or $devStopBytes[2] -ne 0xBF) {
+            throw "Verification failed: $devRoot\STOP_LOCAL.ps1 is missing UTF-8 BOM!"
+          }
+          Write-Host "  [OK] $devRoot\STOP_LOCAL.ps1 verified with UTF-8 BOM."
 
           # Clean any lingering sessions in devRoot
           if (Test-Path "$devRoot\sessions") {
@@ -910,8 +947,11 @@ jobs:
           Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
 
           # 12G. Stop dev backend cleanly with STOP_LOCAL.ps1
-          Write-Host "  --- 12G. Stopping dev backend with STOP_LOCAL.ps1 ---"
-          & "$devRoot\STOP_LOCAL.ps1"
+          Write-Host "  --- 12G. Stopping dev backend with STOP_LOCAL.ps1 using Windows PowerShell 5.1 ---"
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "$devRoot\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Dev layout STOP_LOCAL.ps1 in 12G exited with code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           Start-Sleep -Seconds 2
           if (-not $devProc.HasExited) {
             Stop-Process -Id $devProc.Id -Force -ErrorAction SilentlyContinue
@@ -952,7 +992,10 @@ jobs:
             throw "Custom password login failed!"
           }
           Write-Host "  [OK] Existing webconfig.json was preserved, custom password verified, and NBL bypass confirmed absent."
-          & "$devRoot\STOP_LOCAL.ps1"
+          & $winPs -NoProfile -ExecutionPolicy Bypass -File "$devRoot\STOP_LOCAL.ps1"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Dev layout STOP_LOCAL.ps1 in 12H exited with code $LASTEXITCODE under Windows PowerShell 5.1!"
+          }
           Start-Sleep -Seconds 2
           if (-not $customProc.HasExited) {
             Stop-Process -Id $customProc.Id -Force -ErrorAction SilentlyContinue
