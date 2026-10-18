@@ -955,6 +955,166 @@ jobs:
           $rustCompetitor.WaitForExit(3000)
 
           Write-Host "================================================================="
+          Write-Host "15. Negative Test: Same-Root Competitor Race after Child Marker"
+          Write-Host "================================================================="
+          $raceRoot = Join-Path $env:RUNNER_TEMP "child-race-root"
+          $raceNbl = Join-Path $raceRoot "nbl"
+          $raceNode = Join-Path $raceRoot "runtime\node"
+          New-Item -ItemType Directory -Force -Path $raceNbl | Out-Null
+          New-Item -ItemType Directory -Force -Path $raceNode | Out-Null
+          Copy-Item $systemNode -Destination "$raceNode\node.exe" -Force
+          Copy-Item "package.json" "$raceNbl\package.json" -Force
+          Copy-Item "config.json" "$raceNbl\config.json" -Force
+
+          # Child script writes child_started.marker, then loops forever without listening on port
+          $childScriptCode = @(
+            'import fs from "fs";',
+            'import path from "path";',
+            'fs.writeFileSync("child_started.marker", "started");',
+            'if (process.env.NBL_PROJECT_ROOT) {',
+            '    fs.writeFileSync(path.join(process.env.NBL_PROJECT_ROOT, "child_started.marker"), "started");',
+            '}',
+            'setInterval(() => {}, 1000);'
+          ) -join "`n"
+          Set-Content -Path (Join-Path $raceNbl "server.mjs") -Value $childScriptCode -Encoding utf8
+
+          $raceUiPort = 9749
+          $raceBackendPort = 9549
+          $markerPath = Join-Path $raceNbl "child_started.marker"
+          $rootMarkerPath = Join-Path $raceRoot "child_started.marker"
+          if (Test-Path $markerPath) { Remove-Item -Force $markerPath }
+          if (Test-Path $rootMarkerPath) { Remove-Item -Force $rootMarkerPath }
+
+          # Competitor mock script: returns same-root X-JEU-Studio-Root and tracks requests
+          $pyEscapedRoot = $raceRoot.Replace('\', '\\')
+          $pyCompetitorCode = @(
+            'from http.server import HTTPServer, BaseHTTPRequestHandler',
+            'business_requests = 0',
+            'class H(BaseHTTPRequestHandler):',
+            '    def do_GET(self):',
+            '        global business_requests',
+            '        if self.path == "/api/status":',
+            '            self.send_response(200)',
+            '            self.send_header("Content-Type", "application/json")',
+            "            self.send_header('X-JEU-Studio-Root', '$pyEscapedRoot')",
+            '            self.end_headers()',
+            '            self.wfile.write(b''{"ok":true,"status":"competitor_mock"}'')',
+            '        else:',
+            '            business_requests += 1',
+            '            self.send_response(200)',
+            '            self.send_header("Content-Type", "application/json")',
+            '            self.end_headers()',
+            '            self.wfile.write(b''{"ok":true,"hit":"competitor"}'')',
+            '    def log_message(self, format, *args): pass',
+            "s = HTTPServer(('127.0.0.1', $raceBackendPort), H)",
+            's.serve_forever()'
+          ) -join "`n"
+          $competitorPyFile = Join-Path $env:RUNNER_TEMP "mock_same_root_competitor.py"
+          Set-Content -Path $competitorPyFile -Value $pyCompetitorCode -Encoding utf8
+
+          # Start Rust UI
+          $rustRace = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$raceRoot", "--port", "$raceUiPort", "--backend-port", "$raceBackendPort", "--no-open" `
+            -PassThru
+
+          # Wait for the child to write child_started.marker
+          $waitMarkerDeadline = [DateTime]::UtcNow.AddSeconds(10)
+          while (-not (Test-Path $markerPath) -and -not (Test-Path $rootMarkerPath) -and [DateTime]::UtcNow -lt $waitMarkerDeadline) {
+            Start-Sleep -Milliseconds 100
+          }
+          if (-not (Test-Path $markerPath) -and -not (Test-Path $rootMarkerPath)) {
+            throw "Child failed to write startup marker within 10s!"
+          }
+          Write-Host "  Child startup marker detected; now launching same-root competitor on port $raceBackendPort"
+
+          # Start competitor on $raceBackendPort
+          $competitorProc = Start-Process python -ArgumentList @($competitorPyFile) -PassThru
+          Start-Sleep -Seconds 3
+
+          # Assertions:
+          # 1. Health check must report ok: false, backendReady: false
+          $healthRace = Invoke-RestMethod -Uri "http://127.0.0.1:$raceUiPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Race health check: ok=$($healthRace.ok), backendReady=$($healthRace.backendReady), status=$($healthRace.localStatus)"
+          if ($healthRace.backendReady -ne $false -or $healthRace.ok -ne $false) {
+            throw "Expected backendReady: false and ok: false on same-root competitor race!"
+          }
+          if ($healthRace.localStatus -notlike "*已被竞争进程*" -and $healthRace.localStatus -notlike "*非本次启动*") {
+            throw "Expected competitor diagnostic in localStatus, got: $($healthRace.localStatus)"
+          }
+
+          # 2. /api/notes must return HTTP 503 JSON, zero business forwarding
+          $apiRace = Get-HttpStatusAndBody "http://127.0.0.1:$raceUiPort/api/notes"
+          Write-Host "  /api proxy response status: $($apiRace.StatusCode)"
+          if ($apiRace.StatusCode -ne 503) {
+            throw "Expected HTTP 503 for business API when startup failed, got: $($apiRace.StatusCode)"
+          }
+
+          # 3. Competitor process must STILL be alive
+          if ($competitorProc.HasExited) {
+            throw "Same-root competitor process was killed by Rust!"
+          }
+          Write-Host "  [OK] Competitor process remains alive."
+
+          # 4. Spawned child must be reaped and PID file removed
+          $racePidFile = Join-Path $raceRoot "data\local-server.pid.json"
+          if (Test-Path $racePidFile) {
+            throw "PID file was not cleaned up after competitor race failure!"
+          }
+          Write-Host "  [OK] PID file cleaned up, child reaped."
+
+          # Clean up
+          Stop-Process -Id $competitorProc.Id -Force -ErrorAction SilentlyContinue
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$raceUiPort/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:$raceUiPort"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $rustRace.WaitForExit(3000)
+
+          Write-Host "================================================================="
+          Write-Host "16. Negative Test: Live Child Never Binds Timeout"
+          Write-Host "================================================================="
+          $timeoutRoot = Join-Path $env:RUNNER_TEMP "child-timeout-root"
+          $timeoutNbl = Join-Path $timeoutRoot "nbl"
+          $timeoutNode = Join-Path $timeoutRoot "runtime\node"
+          New-Item -ItemType Directory -Force -Path $timeoutNbl | Out-Null
+          New-Item -ItemType Directory -Force -Path $timeoutNode | Out-Null
+          Copy-Item $systemNode -Destination "$timeoutNode\node.exe" -Force
+          Copy-Item "package.json" "$timeoutNbl\package.json" -Force
+          Copy-Item "config.json" "$timeoutNbl\config.json" -Force
+
+          # The child script never binds port, just keeps running
+          Set-Content -Path (Join-Path $timeoutNbl "server.mjs") -Value "setInterval(() => {}, 1000);" -Encoding utf8
+
+          $timeoutUiPort = 9750
+          $timeoutBackendPort = 9550
+          $env:JEU_STUDIO_BACKEND_TIMEOUT_MS = "4000"
+
+          $rustTimeout = Start-Process -FilePath $exePath `
+            -ArgumentList "--root", "$timeoutRoot", "--port", "$timeoutUiPort", "--backend-port", "$timeoutBackendPort", "--no-open" `
+            -PassThru
+          Start-Sleep -Seconds 6
+          $env:JEU_STUDIO_BACKEND_TIMEOUT_MS = $null
+
+          # Assertions:
+          # 1. Health check reports backendReady: false with timeout message
+          $healthTimeout = Invoke-RestMethod -Uri "http://127.0.0.1:$timeoutUiPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          Write-Host "  Timeout health: backendReady=$($healthTimeout.backendReady), status=$($healthTimeout.localStatus)"
+          if ($healthTimeout.backendReady -ne $false) {
+            throw "Expected backendReady: false on child timeout!"
+          }
+          if ($healthTimeout.localStatus -notlike "*超时*") {
+            throw "Expected timeout diagnostic in localStatus, got: $($healthTimeout.localStatus)"
+          }
+
+          # 2. PID file must be cleaned up
+          $timeoutPidFile = Join-Path $timeoutRoot "data\local-server.pid.json"
+          if (Test-Path $timeoutPidFile) {
+            throw "PID file was not cleaned up after child never-binds timeout!"
+          }
+          Write-Host "  [OK] Child timeout handled, PID file cleaned up, child reaped."
+
+          # Clean up
+          Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$timeoutUiPort/studio/exit" -Headers @{ "Origin" = "http://127.0.0.1:$timeoutUiPort"; "X-JEU-Action" = "quit" } -TimeoutSec 3 | Out-Null
+          $rustTimeout.WaitForExit(3000)
+
+          Write-Host "================================================================="
           Write-Host "All Windows CI integration tests passed successfully!"
           Write-Host "================================================================="
           $global:LASTEXITCODE = 0
