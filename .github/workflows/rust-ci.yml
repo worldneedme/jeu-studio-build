@@ -600,7 +600,7 @@ jobs:
           if ($headerRoot.TrimEnd('\/').ToLower() -ne $pkgRoot.TrimEnd('\/').ToLower()) {
             throw "Mismatched X-JEU-Studio-Root: expected $pkgRoot, got $headerRoot"
           }
-          if ($apiResp.Content -notlike "*authenticated*") {
+          if ($apiResp.Content -notlike "*未登录*" -and $apiResp.Content -notlike "*authenticated*") {
             throw "Expected JSON auth payload in 401 response: $($apiResp.Content)"
           }
           Write-Host "  [OK] /api/status passed through 401 with matching X-JEU-Studio-Root: $headerRoot"
