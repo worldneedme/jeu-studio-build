@@ -152,44 +152,53 @@ jobs:
           Write-Host "  [OK] /api/status blocked with HTTP 503 when backend is down."
 
           Write-Host "4. Starting local mock backend on 127.0.0.1:$backendPort with matching root..."
-          $mockListener = [System.Net.HttpListener]::new()
-          $mockListener.Prefixes.Add("http://127.0.0.1:$backendPort/")
-          $mockListener.Start()
+          $mockScript = @"
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import sys
 
-          $mockTask = [System.Threading.Tasks.Task]::Run([Action]{
-            while ($mockListener.IsListening) {
-              try {
-                $ctx = $mockListener.GetContext()
-                $ctx.Response.Headers.Add("X-JEU-Studio-Root", $testRoot)
-                $ctx.Response.ContentType = "application/json"
-                $respBytes = [System.Text.Encoding]::UTF8.GetBytes('{"authenticated":true,"status":"ready"}')
-                $ctx.Response.ContentLength64 = $respBytes.Length
-                $ctx.Response.OutputStream.Write($respBytes, 0, $respBytes.Length)
-                $ctx.Response.OutputStream.Close()
-              } catch {
-                break
-              }
-            }
-          })
+root = sys.argv[1]
+port = int(sys.argv[2])
 
-          Start-Sleep -Milliseconds 500
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('X-JEU-Studio-Root', root)
+        self.end_headers()
+        self.wfile.write(b'{\"authenticated\":true,\"status\":\"ready\"}')
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('X-JEU-Studio-Root', root)
+        self.end_headers()
+        self.wfile.write(b'{\"saved\":true}')
+    def log_message(self, format, *args):
+        pass
+
+server = HTTPServer(('127.0.0.1', port), Handler)
+server.serve_forever()
+"@
+          $mockFile = Join-Path $env:RUNNER_TEMP "mock_backend.py"
+          Set-Content -Path $mockFile -Value $mockScript -Encoding utf8
+          $mockProc = Start-Process python -ArgumentList "$mockFile `"$testRoot`" $backendPort" -PassThru
+          Start-Sleep -Seconds 1
 
           Write-Host "5. Verifying Ready Backend proxy forwarding..."
           $healthReady = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
           if ($healthReady.ok -ne $true -or $healthReady.backendReady -ne $true) {
-            $mockListener.Stop()
-            throw "Assertion failed: health must indicate backendReady: true when mock backend is ready!"
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Assertion failed: health must indicate backendReady: true when mock backend is ready! (got ok=$($healthReady.ok), backendReady=$($healthReady.backendReady), localStatus=$($healthReady.localStatus))"
           }
           Write-Host "  [OK] /studio/health indicates backendReady: true."
 
           $apiResp = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/api/status" -TimeoutSec 3 -ErrorAction Stop
           if ($apiResp.status -ne "ready") {
-            $mockListener.Stop()
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
             throw "Assertion failed: proxy failed to forward /api/status!"
           }
           Write-Host "  [OK] /api/status forwarded successfully with status: ready."
 
-          $mockListener.Stop()
+          Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
 
           Write-Host "6. Security negative tests (Foreign Host, cross-site Origin)..."
           $badHost = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/studio/health" -Headers @{ "Host" = "evil.com" } -SkipHttpErrorCheck -TimeoutSec 2
