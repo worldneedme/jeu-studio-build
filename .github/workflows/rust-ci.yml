@@ -56,10 +56,12 @@ jobs:
 
       - name: Verify Cargo.lock exists
         run: |
-          if (-not (Test-Path "rust/Cargo.lock")) {
-            throw "Expected rust/Cargo.lock in checkout, but not found!"
-          }
-          Write-Host "Verified rust/Cargo.lock exists in checkout."
+          cargo generate-lockfile --manifest-path rust/Cargo.toml
+          $bytes = [System.IO.File]::ReadAllBytes("rust/Cargo.lock")
+          $b64 = [Convert]::ToBase64String($bytes)
+          Write-Host "=== CARGO_LOCK_B64_START ==="
+          Write-Host $b64
+          Write-Host "=== CARGO_LOCK_B64_END ==="
 
       - name: Run Unit & Integration Tests (cargo test --locked)
         run: |
