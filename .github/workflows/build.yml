@@ -958,6 +958,41 @@ jobs:
             Stop-Process -Id $customProc.Id -Force -ErrorAction SilentlyContinue
           }
 
+          # 12I. Negative test: Corrupted webconfig.json must fail closed (no service, no NBL fallback, file bytes preserved)
+          Write-Host "  --- 12I. Negative test: Corrupted webconfig.json must fail closed ---"
+          $corruptContent = "{ INVALID_JSON_DATA_CORRUPT_BYTES: true"
+          Set-Content -Path $devWebCfgFile -Value $corruptContent -Encoding UTF8
+          $corruptBytesBefore = [System.IO.File]::ReadAllBytes($devWebCfgFile)
+          $corruptProc = Start-Process -FilePath $devNodeBin -ArgumentList "server.mjs" -WorkingDirectory $devRoot -Environment @{
+            PATH = "D:\JEU-Studio\runtime\node;D:\JEU-Studio\runtime\ffmpeg\bin;$env:SystemRoot\System32"
+            NBL_PORT = "9527"
+            NBL_TEST_BROWSER_STUB = "1"
+          } -PassThru
+          Start-Sleep -Seconds 3
+          # Corrupted config must cause process to exit immediately with failure code
+          if (-not $corruptProc.HasExited) {
+            Stop-Process -Id $corruptProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Corrupted config test failed: server process should have exited on corrupted webconfig.json!"
+          }
+          if ($corruptProc.ExitCode -eq 0) {
+            throw "Corrupted config test failed: server process exited with code 0 instead of failure code!"
+          }
+          # Assert port 9527 is NOT listening and does NOT accept NBL
+          $portListening = $false
+          try {
+            $testReq = Invoke-WebRequest -Uri "http://127.0.0.1:9527/api/status" -TimeoutSec 2 -ErrorAction Stop
+            $portListening = $true
+          } catch {}
+          if ($portListening) {
+            throw "Corrupted config test failed: port 9527 should NOT be listening on corrupted config!"
+          }
+          # Assert file bytes are completely untouched
+          $corruptBytesAfter = [System.IO.File]::ReadAllBytes($devWebCfgFile)
+          if ([System.Convert]::ToBase64String($corruptBytesBefore) -ne [System.Convert]::ToBase64String($corruptBytesAfter)) {
+            throw "Corrupted config test failed: original corrupted file bytes were modified!"
+          }
+          Write-Host "  [OK] Corrupted webconfig.json failed closed (process exited code $($corruptProc.ExitCode), port closed, file bytes untouched)."
+
       - name: Calculate Checksums for Installer and Portable Zip
         run: |
           $setupHash = (Get-FileHash JEUStudio-Setup-x64.exe -Algorithm SHA256).Hash.ToLower()
