@@ -155,15 +155,27 @@ jobs:
           Copy-Item "STOP_LOCAL.ps1" "$bundle\"
           Copy-Item "config.json" "$bundle\"
 
-          # 6. Copy nbl source and node_modules
-          $nblFiles = @("server.mjs", "batch.mjs", "capture-session.mjs", "audio_to_srt.py", "bcut_asr.py", "prompts.txt", "package.json", "package-lock.json", "config.json")
+          # 6. Copy complete nbl source, scripts, web assets, and node_modules
+          $nblFiles = @(
+            "package.json", "package-lock.json", "server.mjs", "batch.mjs",
+            "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
+            "archive-utils.mjs", "batch-safety.mjs", "quota-policy.mjs",
+            "capture-session.mjs", "browser-session.sh", "run.sh",
+            "requirements.txt", "prompts.txt", "README.md", "DEPLOY.md"
+          )
           foreach ($f in $nblFiles) {
-            if (Test-Path $f) { Copy-Item $f "$bundle\nbl\" }
+            if (Test-Path $f) { Copy-Item $f "$bundle\nbl\" -Force }
+          }
+          if (Test-Path "scripts") {
+            Copy-Item -Recurse "scripts" "$bundle\nbl\scripts" -Force
+          }
+          if (Test-Path "deploy") {
+            Copy-Item -Recurse "deploy" "$bundle\nbl\deploy" -Force
           }
           if (Test-Path "public") {
-            Copy-Item -Recurse "public" "$bundle\nbl\public"
+            Copy-Item -Recurse "public" "$bundle\nbl\public" -Force
           }
-          Copy-Item -Recurse "node_modules" "$bundle\nbl\node_modules"
+          Copy-Item -Recurse "node_modules" "$bundle\nbl\node_modules" -Force
 
           Write-Host "Release bundle packaged successfully into package/."
 
@@ -263,9 +275,21 @@ jobs:
           Write-Host "6A. Negative test: PID reuse / creation time check (real server.mjs on port 9655, stale startedAt)..."
           New-Item -ItemType Directory -Force -Path "D:\JEU-Studio\test-6a"
           # Launch real server.mjs using bundled node on independent test port 9655
-          $reusedProc = Start-Process -FilePath "D:\JEU-Studio\runtime\node\node.exe" -ArgumentList "D:\JEU-Studio\nbl\server.mjs" -Environment @{ NBL_PORT = "9655"; NBL_DATA_DIR = "D:\JEU-Studio\test-6a" } -PassThru
+          $reusedProc = Start-Process -FilePath "D:\JEU-Studio\runtime\node\node.exe" `
+            -ArgumentList "D:\JEU-Studio\nbl\server.mjs" `
+            -WorkingDirectory "D:\JEU-Studio\nbl" `
+            -Environment @{ NBL_PORT = "9655"; NBL_DATA_DIR = "D:\JEU-Studio\test-6a" } `
+            -RedirectStandardError "$env:RUNNER_TEMP\server-6a.err" `
+            -RedirectStandardOutput "$env:RUNNER_TEMP\server-6a.out" `
+            -PassThru
           Write-Host "  Started real server.mjs on test port 9655 (PID $($reusedProc.Id))"
           Start-Sleep -Seconds 2
+          if ($reusedProc.HasExited) {
+            Write-Host "  [ERROR] Server exited prematurely! Logs:"
+            if (Test-Path "$env:RUNNER_TEMP\server-6a.err") { Get-Content "$env:RUNNER_TEMP\server-6a.err" }
+            if (Test-Path "$env:RUNNER_TEMP\server-6a.out") { Get-Content "$env:RUNNER_TEMP\server-6a.out" }
+            throw "Failed to start real server.mjs for negative test 6A (PID $($reusedProc.Id) exited prematurely)!"
+          }
           $reusedPidInfo = @{
             pid = $reusedProc.Id
             script = "D:\JEU-Studio\nbl\server.mjs"
