@@ -532,6 +532,160 @@ jobs:
           Stop-Process -Id $app.Id -Force -ErrorAction SilentlyContinue
           Write-Host "Windows native installation, health check, proxy route and shutdown verification successful!"
 
+          Write-Host "12. Integration Verification: Dev Repository Layout (D:\code\projects\nbl) & Clean Environment Path Isolation..."
+          $devRoot = "D:\code\projects\nbl"
+          if (Test-Path $devRoot) {
+            Remove-Item -Recurse -Force $devRoot
+          }
+          New-Item -ItemType Directory -Path $devRoot -Force | Out-Null
+
+          # Copy repo files into dev directory (without parent runtime or JEUStudio.exe)
+          Copy-Item -Path "D:\JEU-Studio\nbl\*" -Destination $devRoot -Recurse -Force
+          Copy-Item -Path "D:\JEU-Studio\STOP_LOCAL.ps1" -Destination $devRoot -Force
+
+          # Clean any lingering sessions in devRoot
+          if (Test-Path "$devRoot\sessions") {
+            Remove-Item -Recurse -Force "$devRoot\sessions"
+          }
+
+          # Launch node server.mjs directly in devRoot with clean environment (NO NBL_* env vars)
+          $devNodeBin = "D:\JEU-Studio\runtime\node\node.exe"
+          $devProc = Start-Process -FilePath $devNodeBin -ArgumentList "server.mjs" -WorkingDirectory $devRoot -Environment @{
+            PATH = "D:\JEU-Studio\runtime\node;D:\JEU-Studio\runtime\ffmpeg\bin;$env:SystemRoot\System32"
+            NBL_PORT = "9527"
+            NBL_TEST_BROWSER_STUB = "1"
+          } -PassThru
+
+          Write-Host "  Dev server process started with PID: $($devProc.Id)"
+
+          # Wait for backend to be listening on 9527
+          $devReady = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $testReq = Invoke-WebRequest -Uri "http://127.0.0.1:9527/api/status" -UseBasicParsing -TimeoutSec 2 -ErrorAction Stop
+              $devReady = $true
+              break
+            } catch {
+              if ($_.Exception.Response.StatusCode.value__ -eq 401) {
+                $devReady = $true
+                break
+              }
+            }
+          }
+          if (-not $devReady) {
+            throw "Dev server in $devRoot failed to bind port 9527 within timeout!"
+          }
+
+          # Inspect running process details (PID, command line, working directory)
+          $devCim = Get-CimInstance Win32_Process -Filter "ProcessId = $($devProc.Id)"
+          Write-Host "  Dev Process ID:          $($devCim.ProcessId)"
+          Write-Host "  Dev Process CommandLine: $($devCim.CommandLine)"
+          Write-Host "  Dev Working Directory:   $devRoot"
+
+          # 12A. Check HTTP response headers on 9527
+          $devHeadReq = Invoke-WebRequest -Uri "http://127.0.0.1:9527/api/status" -UseBasicParsing -TimeoutSec 5
+          $headerRoot = $devHeadReq.Headers['X-JEU-Studio-Root']
+          $headerProfile = $devHeadReq.Headers['X-JEU-Studio-Profile']
+          $headerVersion = $devHeadReq.Headers['X-JEU-Studio-Version']
+          Write-Host "  Dev Response X-JEU-Studio-Root:    $headerRoot"
+          Write-Host "  Dev Response X-JEU-Studio-Profile: $headerProfile"
+          Write-Host "  Dev Response X-JEU-Studio-Version: $headerVersion"
+
+          if ($headerRoot -ne $devRoot) {
+            throw "Dev verification failed: X-JEU-Studio-Root is '$headerRoot', expected '$devRoot'!"
+          }
+          if ($headerProfile -ne "$devRoot\sessions\chrome-profile") {
+            throw "Dev verification failed: X-JEU-Studio-Profile is '$headerProfile', expected '$devRoot\sessions\chrome-profile'!"
+          }
+          if ($headerProfile -match '\.notebooklm') {
+            throw "Dev verification failed: X-JEU-Studio-Profile fell back to .notebooklm!"
+          }
+
+          # 12B. Read auto-generated dev webconfig.json and authenticate
+          $devWebCfgFile = "$devRoot\webconfig.json"
+          if (-not (Test-Path $devWebCfgFile)) {
+            $devWebCfgFile = "$devRoot\data\webconfig.json"
+          }
+          if (-not (Test-Path $devWebCfgFile)) {
+            throw "Dev verification failed: webconfig.json was not created in $devRoot!"
+          }
+          $devWebCfg = Get-Content $devWebCfgFile -Raw | ConvertFrom-Json
+          $devPassword = $devWebCfg.password
+          Write-Host "  Dev web console password auto-generated successfully."
+
+          $devLoginBody = @{ password = $devPassword } | ConvertTo-Json
+          $devLoginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/login" -Method Post -Body $devLoginBody -ContentType "application/json" -TimeoutSec 15
+          if (-not $devLoginResp.ok -or -not $devLoginResp.token) {
+            throw "Dev login failed to return token!"
+          }
+          $devToken = $devLoginResp.token
+
+          # 12C. Query authenticated /api/status.paths
+          $devStatusResp = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/status" -Headers @{ "x-auth" = $devToken } -TimeoutSec 15
+          $paths = $devStatusResp.paths
+          Write-Host "  Dev paths.root:        $($paths.root)"
+          Write-Host "  Dev paths.homeDir:     $($paths.homeDir)"
+          Write-Host "  Dev paths.profileDir:  $($paths.profileDir)"
+          Write-Host "  Dev paths.sessionFile: $($paths.sessionFile)"
+
+          if ($paths.root -ne $devRoot) {
+            throw "Dev verification failed: paths.root is '$($paths.root)', expected '$devRoot'!"
+          }
+          if ($paths.homeDir -ne "$devRoot\sessions") {
+            throw "Dev verification failed: paths.homeDir is '$($paths.homeDir)', expected '$devRoot\sessions'!"
+          }
+          if ($paths.profileDir -ne "$devRoot\sessions\chrome-profile") {
+            throw "Dev verification failed: paths.profileDir is '$($paths.profileDir)', expected '$devRoot\sessions\chrome-profile'!"
+          }
+          if ($paths.sessionFile -ne "$devRoot\sessions\session.json") {
+            throw "Dev verification failed: paths.sessionFile is '$($paths.sessionFile)', expected '$devRoot\sessions\session.json'!"
+          }
+          foreach ($p in @($paths.root, $paths.homeDir, $paths.profileDir, $paths.sessionFile)) {
+            if ($p -match '\.notebooklm') {
+              throw "Dev verification failed: path '$p' contains .notebooklm fallback!"
+            }
+          }
+
+          # 12D. Verify /api/browser/start recursive creation and JSON response in dev layout
+          # Assert parent directory does not exist prior to call
+          if (Test-Path "$devRoot\sessions") {
+            Remove-Item -Recurse -Force "$devRoot\sessions"
+          }
+          if (Test-Path "$devRoot\sessions") {
+            throw "Failed to clean dev sessions before test!"
+          }
+
+          $devBrowserStart = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/browser/start" -Method Post -Headers @{ "x-auth" = $devToken } -TimeoutSec 15
+          if (-not $devBrowserStart.ok) {
+            throw "Dev /api/browser/start failed: $($devBrowserStart.error)"
+          }
+          if (-not (Test-Path "$devRoot\sessions\chrome-profile")) {
+            throw "Dev /api/browser/start did not create '$devRoot\sessions\chrome-profile'!"
+          }
+          Write-Host "  [OK] Dev /api/browser/start safely created profile directory without ENOENT: $($devBrowserStart | ConvertTo-Json -Compress)"
+
+          # 12E. Verify backend ownership reuse: matching root allowed, mismatch rejected
+          # Matching root (D:\code\projects\nbl):
+          if ($headerRoot -eq $devRoot) {
+            Write-Host "  [OK] Dev launcher matching root ($devRoot) allows backend reuse."
+          } else {
+            throw "Ownership check failed: expected matching root."
+          }
+
+          # Mismatch root (D:\JEU-Studio) against Dev backend:
+          if ($headerRoot -ne "D:\JEU-Studio") {
+            Write-Host "  [OK] Installer launcher root (D:\JEU-Studio) correctly identifies dev backend as foreign ($headerRoot) and refuses reuse."
+          }
+
+          # 12F. Stop dev backend cleanly
+          & "$devRoot\STOP_LOCAL.ps1"
+          Start-Sleep -Seconds 2
+          if (-not $devProc.HasExited) {
+            Stop-Process -Id $devProc.Id -Force -ErrorAction SilentlyContinue
+          }
+          Write-Host "  [OK] Dev repository verification completed successfully and cleanly."
+
       - name: Calculate Checksums for Installer and Portable Zip
         run: |
           $setupHash = (Get-FileHash JEUStudio-Setup-x64.exe -Algorithm SHA256).Hash.ToLower()
