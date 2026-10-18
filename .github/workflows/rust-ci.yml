@@ -95,6 +95,24 @@ jobs:
           $testRoot = Join-Path $env:RUNNER_TEMP "jeu-r2a-smoke-test"
           New-Item -ItemType Directory -Force -Path $testRoot | Out-Null
 
+          function Get-HttpStatusAndBody($uri, $headers = @{}, $method = "GET") {
+            try {
+              $r = Invoke-WebRequest -Uri $uri -Method $method -Headers $headers -SkipHttpErrorCheck -TimeoutSec 3
+              return @{ StatusCode = [int]$r.StatusCode; Content = $r.Content; Headers = $r.Headers }
+            } catch {
+              $code = if ($_.Exception.Response) { [int]$_.Exception.Response.StatusCode.value__ } else { 0 }
+              $body = ""
+              if ($_.Exception.Response) {
+                $stream = $_.Exception.Response.GetResponseStream()
+                if ($stream) {
+                  $reader = New-Object System.IO.StreamReader($stream)
+                  $body = $reader.ReadToEnd()
+                }
+              }
+              return @{ StatusCode = $code; Content = $body; Headers = @{} }
+            }
+          }
+
           Write-Host "1. Launching jeu-studio-native.exe on 127.0.0.1:$testPort with injected backend port $backendPort..."
           $proc = Start-Process -FilePath $exePath `
             -ArgumentList "--port", "$testPort", "--backend-port", "$backendPort", "--no-open", "--root", "$testRoot" `
@@ -107,7 +125,7 @@ jobs:
             throw "Executable exited unexpectedly with code $($proc.ExitCode)!"
           }
 
-          Write-Host "2. Probing Static UI assets (/, /app.css, /app.js)..."
+          Write-Host "2. Probing Static UI assets (/, /app.css, /app.js) with no-store and CSP..."
           $uiResp = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/" -TimeoutSec 3 -ErrorAction Stop
           if ($uiResp.StatusCode -ne 200 -or -not ($uiResp.Content -like "*JEU Studio*")) {
             throw "Failed loading root UI /: StatusCode $($uiResp.StatusCode)"
@@ -124,13 +142,19 @@ jobs:
           if ($cssResp.StatusCode -ne 200 -or $cssResp.Headers["Content-Type"] -notlike "*text/css*") {
             throw "Failed loading /app.css: StatusCode $($cssResp.StatusCode)"
           }
-          Write-Host "  [OK] /app.css loaded with 200 OK and text/css."
+          if ($cssResp.Headers["Cache-Control"] -notlike "*no-store*") {
+            throw "Missing Cache-Control: no-store on /app.css"
+          }
+          Write-Host "  [OK] /app.css loaded with 200 OK, text/css, and no-store."
 
           $jsResp = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/app.js" -TimeoutSec 3 -ErrorAction Stop
           if ($jsResp.StatusCode -ne 200 -or $jsResp.Headers["Content-Type"] -notlike "*javascript*") {
             throw "Failed loading /app.js: StatusCode $($jsResp.StatusCode)"
           }
-          Write-Host "  [OK] /app.js loaded with 200 OK and javascript."
+          if ($jsResp.Headers["Cache-Control"] -notlike "*no-store*") {
+            throw "Missing Cache-Control: no-store on /app.js"
+          }
+          Write-Host "  [OK] /app.js loaded with 200 OK, javascript, and no-store."
 
           Write-Host "3. Verifying Unready Backend state (port $backendPort not listening)..."
           $healthData = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
@@ -139,35 +163,76 @@ jobs:
           }
           Write-Host "  [OK] /studio/health reports backendReady: false, localStatus: $($healthData.localStatus)"
 
-          try {
-            $apiBlocked = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/api/status" -SkipHttpErrorCheck -TimeoutSec 3
-            if ($apiBlocked.StatusCode -ne 503) {
-              throw "Expected HTTP 503 on unready /api/status, got $($apiBlocked.StatusCode)"
-            }
-          } catch {
-            if ($_.Exception.Response.StatusCode.value__ -ne 503) {
-              throw "Expected HTTP 503 on unready /api/status, got $($_.Exception.Message)"
-            }
+          $apiBlocked = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/status"
+          if ($apiBlocked.StatusCode -ne 503) {
+            throw "Expected HTTP 503 on unready /api/status, got $($apiBlocked.StatusCode)"
           }
           Write-Host "  [OK] /api/status blocked with HTTP 503 when backend is down."
 
-          Write-Host "4. Starting local mock backend on 127.0.0.1:$backendPort with matching root..."
+          Write-Host "4. Starting controllable local mock backend on 127.0.0.1:$backendPort..."
           $pyCode = @(
             'from http.server import HTTPServer, BaseHTTPRequestHandler',
             'import sys',
-            'root = sys.argv[1]',
+            'default_root = sys.argv[1]',
             'port = int(sys.argv[2])',
+            'state = {',
+            '    "root": default_root,',
+            '    "code": 200,',
+            '    "biz_count": 0,',
+            '}',
             'class Handler(BaseHTTPRequestHandler):',
             '    def do_GET(self):',
-            '        self.send_response(200)',
+            '        if self.path == "/mock/set-401":',
+            '            state["code"] = 401',
+            '            state["root"] = default_root',
+            '            self.send_response(200)',
+            '            self.end_headers()',
+            '            self.wfile.write(b"ok")',
+            '            return',
+            '        if self.path == "/mock/set-200":',
+            '            state["code"] = 200',
+            '            state["root"] = default_root',
+            '            self.send_response(200)',
+            '            self.end_headers()',
+            '            self.wfile.write(b"ok")',
+            '            return',
+            '        if self.path == "/mock/set-foreign-root":',
+            '            state["root"] = "C:\\Foreign-Path"',
+            '            self.send_response(200)',
+            '            self.end_headers()',
+            '            self.wfile.write(b"ok")',
+            '            return',
+            '        if self.path == "/mock/set-missing-root":',
+            '            state["root"] = None',
+            '            self.send_response(200)',
+            '            self.end_headers()',
+            '            self.wfile.write(b"ok")',
+            '            return',
+            '        if self.path == "/mock/biz-count":',
+            '            self.send_response(200)',
+            '            self.end_headers()',
+            '            self.wfile.write(str(state["biz_count"]).encode())',
+            '            return',
+            '        if self.path != "/api/status":',
+            '            state["biz_count"] += 1',
+            '        code = state["code"]',
+            '        self.send_response(code)',
             '        self.send_header("Content-Type", "application/json")',
-            '        self.send_header("X-JEU-Studio-Root", root)',
+            '        self.send_header("Cache-Control", "no-store")',
+            '        if state["root"] is not None:',
+            '            self.send_header("X-JEU-Studio-Root", state["root"])',
             '        self.end_headers()',
-            '        self.wfile.write(b''{"authenticated":true,"status":"ready"}'')',
+            '        if code == 401:',
+            '            self.wfile.write(b''{"authenticated":false,"status":"unauthorized"}'')',
+            '        else:',
+            '            self.wfile.write(b''{"authenticated":true,"status":"ready"}'')',
             '    def do_POST(self):',
+            '        state["biz_count"] += 1',
             '        self.send_response(200)',
             '        self.send_header("Content-Type", "application/json")',
-            '        self.send_header("X-JEU-Studio-Root", root)',
+            '        self.send_header("Cache-Control", "no-store")',
+            '        if state["root"] is not None:',
+            '            self.send_header("X-JEU-Studio-Root", state["root"])',
             '        self.end_headers()',
             '        self.wfile.write(b''{"saved":true}'')',
             '    def log_message(self, format, *args): pass',
@@ -179,11 +244,11 @@ jobs:
           $mockProc = Start-Process python -ArgumentList "$mockFile `"$testRoot`" $backendPort" -PassThru
           Start-Sleep -Seconds 1
 
-          Write-Host "5. Verifying Ready Backend proxy forwarding..."
+          Write-Host "5a. Verifying Ready Backend proxy forwarding (matching root 200)..."
           $healthReady = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
           if ($healthReady.ok -ne $true -or $healthReady.backendReady -ne $true) {
             Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
-            throw "Assertion failed: health must indicate backendReady: true when mock backend is ready! (got ok=$($healthReady.ok), backendReady=$($healthReady.backendReady), localStatus=$($healthReady.localStatus))"
+            throw "Assertion failed: health must indicate backendReady: true when mock backend is ready!"
           }
           Write-Host "  [OK] /studio/health indicates backendReady: true."
 
@@ -194,20 +259,96 @@ jobs:
           }
           Write-Host "  [OK] /api/status forwarded successfully with status: ready."
 
-          Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+          Write-Host "5b. Testing same-root 401 passthrough..."
+          Invoke-WebRequest -Uri "http://127.0.0.1:$backendPort/mock/set-401" -TimeoutSec 2 -ErrorAction Stop | Out-Null
+          $health401 = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/studio/health" -TimeoutSec 3 -ErrorAction Stop
+          if ($health401.ok -ne $true -or $health401.backendReady -ne $true) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Assertion failed: health must indicate backendReady: true when mock backend returns 401 with matching root!"
+          }
+          $res401 = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/status"
+          if ($res401.StatusCode -ne 401 -or -not ($res401.Content -like "*unauthorized*")) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected 401 passthrough with unauthorized payload, got code $($res401.StatusCode), body: $($res401.Content)"
+          }
+          Write-Host "  [OK] Same-root 401 passthrough verified (HTTP 401 and payload preserved)."
 
-          Write-Host "6. Security negative tests (Foreign Host, cross-site Origin)..."
-          $badHost = Invoke-WebRequest -Uri "http://127.0.0.1:$testPort/studio/health" -Headers @{ "Host" = "evil.com" } -SkipHttpErrorCheck -TimeoutSec 2
+          Write-Host "5c. Testing foreign root 503 without forwarding to business API..."
+          Invoke-WebRequest -Uri "http://127.0.0.1:$backendPort/mock/set-foreign-root" -TimeoutSec 2 -ErrorAction Stop | Out-Null
+          $bizBeforeForeign = [int](Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/mock/biz-count" -TimeoutSec 2)
+          $resForeign = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/notes"
+          if ($resForeign.StatusCode -ne 503 -or -not ($resForeign.Content -like "*另一目录*")) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected 503 with '另一目录', got StatusCode $($resForeign.StatusCode), Content: $($resForeign.Content)"
+          }
+          $bizAfterForeign = [int](Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/mock/biz-count" -TimeoutSec 2)
+          if ($bizBeforeForeign -ne $bizAfterForeign) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign root leaked business API call to backend! (before: $bizBeforeForeign, after: $bizAfterForeign)"
+          }
+          if ($mockProc.HasExited) {
+            throw "Mock backend process died during foreign root check!"
+          }
+          Write-Host "  [OK] Foreign root blocked with 503; 0 business API calls forwarded; mock process alive."
+
+          Write-Host "5d. Testing missing root header 503 without forwarding to business API..."
+          Invoke-WebRequest -Uri "http://127.0.0.1:$backendPort/mock/set-missing-root" -TimeoutSec 2 -ErrorAction Stop | Out-Null
+          $bizBeforeMissing = [int](Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/mock/biz-count" -TimeoutSec 2)
+          $resMissing = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/notes"
+          if ($resMissing.StatusCode -ne 503 -or -not ($resMissing.Content -like "*未携带 JEU Studio 归属标识*")) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected 503 with '未携带 JEU Studio 归属标识', got StatusCode $($resMissing.StatusCode), Content: $($resMissing.Content)"
+          }
+          $bizAfterMissing = [int](Invoke-RestMethod -Uri "http://127.0.0.1:$backendPort/mock/biz-count" -TimeoutSec 2)
+          if ($bizBeforeMissing -ne $bizAfterMissing) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Missing root header leaked business API call to backend! (before: $bizBeforeMissing, after: $bizAfterMissing)"
+          }
+          if ($mockProc.HasExited) {
+            throw "Mock backend process died during missing root check!"
+          }
+          Write-Host "  [OK] Missing root header blocked with 503; 0 business API calls forwarded; mock process alive."
+
+          Write-Host "5e. Testing backend switching root blocking..."
+          Invoke-WebRequest -Uri "http://127.0.0.1:$backendPort/mock/set-200" -TimeoutSec 2 -ErrorAction Stop | Out-Null
+          $resValid = Invoke-RestMethod -Uri "http://127.0.0.1:$testPort/api/notes" -TimeoutSec 3 -ErrorAction Stop
+          if ($resValid.status -ne "ready") {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Failed calling /api/notes with valid matching root!"
+          }
+          Write-Host "  Valid request succeeded on matching root."
+
+          Invoke-WebRequest -Uri "http://127.0.0.1:$backendPort/mock/set-foreign-root" -TimeoutSec 2 -ErrorAction Stop | Out-Null
+          $resSwitched = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/notes"
+          if ($resSwitched.StatusCode -ne 503) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Expected 503 after backend switched root, got code $($resSwitched.StatusCode)"
+          }
+          Write-Host "  [OK] Backend switched root dynamically re-probed and blocked with 503."
+
+          Write-Host "6. Security negative tests (Foreign Host, cross-site Origin, Sec-Fetch-Site: cross-site)..."
+          $badHost = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/studio/health" -Headers @{ "Host" = "evil.com" }
           if ($badHost.StatusCode -ne 403) {
-            throw "Host evil.com not rejected with 403!"
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Host evil.com not rejected with 403! Got $($badHost.StatusCode)"
           }
           Write-Host "  [OK] Host evil.com rejected with 403 Forbidden."
 
-          $badOrigin = Invoke-WebRequest -Method POST -Uri "http://127.0.0.1:$testPort/api/save" -Headers @{ "Origin" = "http://evil.com" } -SkipHttpErrorCheck -TimeoutSec 2
+          $badOrigin = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/save" -Method "POST" -Headers @{ "Origin" = "http://evil.com" }
           if ($badOrigin.StatusCode -ne 403) {
-            throw "Mutating POST with foreign Origin not rejected with 403!"
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Mutating POST with foreign Origin not rejected with 403! Got $($badOrigin.StatusCode)"
           }
           Write-Host "  [OK] Mutating POST with foreign Origin rejected with 403 Forbidden."
+
+          $badSecFetch = Get-HttpStatusAndBody "http://127.0.0.1:$testPort/api/save" -Method "POST" -Headers @{ "Origin" = "http://127.0.0.1:$testPort"; "Sec-Fetch-Site" = "cross-site" }
+          if ($badSecFetch.StatusCode -ne 403) {
+            Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
+            throw "POST with Sec-Fetch-Site: cross-site not rejected with 403! Got $($badSecFetch.StatusCode)"
+          }
+          Write-Host "  [OK] POST with Sec-Fetch-Site: cross-site rejected with 403 Forbidden."
+
+          Stop-Process -Id $mockProc.Id -Force -ErrorAction SilentlyContinue
 
           Write-Host "7. Testing /studio/exit graceful shutdown..."
           $exitResp = Invoke-RestMethod -Method POST -Uri "http://127.0.0.1:$testPort/studio/exit" `
@@ -218,7 +359,6 @@ jobs:
           }
           Write-Host "  [OK] /studio/exit returned ok: true."
 
-          # Wait for process to exit cleanly
           $exited = $proc.WaitForExit(5000)
           if (-not $exited) {
             Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
@@ -232,3 +372,4 @@ jobs:
             throw "R2a violation: files written to root directory ($($items.Name -join ', '))!"
           }
           Write-Host "  [OK] Verified zero files/directories written to test root."
+
