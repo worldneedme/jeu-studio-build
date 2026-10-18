@@ -670,20 +670,156 @@ jobs:
           }
           Write-Host "  [OK] Dev /api/browser/start safely created profile directory without ENOENT: $($devBrowserStart | ConvertTo-Json -Compress)"
 
-          # 12E. Verify backend ownership reuse: matching root allowed, mismatch rejected
-          # Matching root (D:\code\projects\nbl):
-          if ([System.IO.Path]::GetFullPath($headerRoot) -eq [System.IO.Path]::GetFullPath($devRoot)) {
-            Write-Host "  [OK] Dev launcher matching root ($devRoot) allows backend reuse."
-          } else {
-            throw "Ownership check failed: expected matching root."
+          # 12E. Integration test: Caller behavior when port 9527 is occupied by foreign dev backend (D:\code\projects\nbl)
+          Write-Host "  --- 12E. Testing installer startup against foreign dev backend on 9527 ---"
+          Write-Host "  Current dev process PID: $($devProc.Id)"
+          Write-Host "  Current dev process CommandLine: $($devCim.CommandLine)"
+          Write-Host "  Current dev X-JEU-Studio-Root: $headerRoot"
+          Write-Host "  Current dev paths.root: $($paths.root)"
+          Write-Host "  Current dev paths.homeDir: $($paths.homeDir)"
+          Write-Host "  Current dev paths.profileDir: $($paths.profileDir)"
+          Write-Host "  Current dev paths.sessionFile: $($paths.sessionFile)"
+
+          # Launch D:\JEU-Studio\JEUStudio.exe (installer directory).
+          # It must detect that 9527 is occupied by foreign root ($devRoot), refuse to reuse, NOT kill dev process, and set backendReady=false.
+          $installerStudioApp = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "--no-open","--port","9735" -WorkingDirectory "D:\JEU-Studio" -PassThru
+          Write-Host "  Installer JEUStudio.exe started with PID: $($installerStudioApp.Id) on port 9735"
+
+          # Wait for JEUStudio.exe to start its desktop HTTP server on 9735
+          $installerReady = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $chk = Invoke-RestMethod -Uri "http://127.0.0.1:9735/studio/health" -TimeoutSec 2 -ErrorAction Stop
+              $installerReady = $true
+              break
+            } catch {}
+          }
+          if (-not $installerReady) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Installer JEUStudio.exe failed to start desktop HTTP server on port 9735!"
           }
 
-          # Mismatch root (D:\JEU-Studio) against Dev backend:
-          if ([System.IO.Path]::GetFullPath($headerRoot) -ne [System.IO.Path]::GetFullPath("D:\JEU-Studio")) {
-            Write-Host "  [OK] Installer launcher root (D:\JEU-Studio) correctly identifies dev backend as foreign ($headerRoot) and refuses reuse."
+          # 1. Assert /studio/health: ok=false, backendReady=false, localStatus reports foreign directory mismatch
+          $installerHealth = Invoke-RestMethod -Uri "http://127.0.0.1:9735/studio/health" -TimeoutSec 5
+          Write-Host "  Installer /studio/health response: $($installerHealth | ConvertTo-Json -Compress)"
+          if ($installerHealth.ok -ne $false) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign occupation test failed: /studio/health.ok must be false, got: $($installerHealth.ok)"
+          }
+          if ($installerHealth.backendReady -ne $false) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign occupation test failed: /studio/health.backendReady must be false, got: $($installerHealth.backendReady)"
+          }
+          if ($installerHealth.localStatus -notmatch "另一目录" -or $installerHealth.localStatus -notmatch [regex]::Escape($devRoot)) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign occupation test failed: localStatus must report foreign directory mismatch with $devRoot! Got: $($installerHealth.localStatus)"
+          }
+          Write-Host "  [OK] /studio/health correctly reported ok=false, backendReady=false, and foreign directory mismatch."
+
+          # 2. Assert /api/* returns HTTP 503 and ok=false without calling upstream
+          $apiCheckPassed = $false
+          try {
+            $apiResp = Invoke-WebRequest -Uri "http://127.0.0.1:9735/api/status" -SkipHttpErrorCheck -TimeoutSec 5
+            Write-Host "  Installer /api/status HTTP status: $($apiResp.StatusCode)"
+            Write-Host "  Installer /api/status response:    $($apiResp.Content)"
+            if ($apiResp.StatusCode -eq 503) {
+              $apiJson = $apiResp.Content | ConvertFrom-Json
+              if ($apiJson.ok -eq $false -and $apiJson.error -match "另一目录") {
+                $apiCheckPassed = $true
+              }
+            }
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -eq 503) {
+              $apiCheckPassed = $true
+            }
+          }
+          if (-not $apiCheckPassed) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign occupation test failed: /api/status must return HTTP 503 with JSON ok=false error!"
+          }
+          Write-Host "  [OK] /api/* correctly returned HTTP 503 Service Unavailable with JSON error diagnosis."
+
+          # 3. Assert external dev process ($devProc.Id) was NOT killed and remains healthy
+          $checkDevProc = Get-Process -Id $devProc.Id -ErrorAction SilentlyContinue
+          if (-not $checkDevProc -or $checkDevProc.HasExited) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign occupation test failed: external dev process PID $($devProc.Id) was killed or stopped!"
+          }
+          Write-Host "  [OK] External dev process PID $($devProc.Id) is alive and was NOT killed."
+
+          # Verify external dev backend on 9527 is still responding normally
+          $devStillAlive = Invoke-RestMethod -Uri "http://127.0.0.1:9527/api/status" -Headers @{ "x-auth" = $devToken } -TimeoutSec 5
+          if ($devStillAlive.paths.root -ne $devRoot) {
+            Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Foreign occupation test failed: dev backend on 9527 was corrupted or not responding!"
+          }
+          Write-Host "  [OK] Dev backend on 9527 remains fully operational and responsive."
+
+          # Clean up installer test app
+          Stop-Process -Id $installerStudioApp.Id -Force -ErrorAction SilentlyContinue
+
+          # 12F. Integration test: Caller behavior for same-directory safe reuse
+          Write-Host "  --- 12F. Testing same-directory launcher safe reuse ---"
+          Copy-Item -Path "D:\JEU-Studio\JEUStudio.exe" -Destination "$devRoot\JEUStudio.exe" -Force
+          $devStudioApp = Start-Process -FilePath "$devRoot\JEUStudio.exe" -ArgumentList "--no-open","--port","9736" -WorkingDirectory $devRoot -PassThru
+          Write-Host "  Same-directory JEUStudio.exe started with PID: $($devStudioApp.Id) on port 9736"
+
+          $devStudioReady = $false
+          for ($i = 0; $i -lt 15; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $chk = Invoke-RestMethod -Uri "http://127.0.0.1:9736/studio/health" -TimeoutSec 2 -ErrorAction Stop
+              $devStudioReady = $true
+              break
+            } catch {}
+          }
+          if (-not $devStudioReady) {
+            Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Same-directory JEUStudio.exe failed to start desktop HTTP server on port 9736!"
           }
 
-          # 12F. Stop dev backend cleanly
+          # Assert same-directory /studio/health: ok=true, backendReady=true, localStatus="现有本机 NBL 服务已运行"
+          $sameHealth = Invoke-RestMethod -Uri "http://127.0.0.1:9736/studio/health" -TimeoutSec 5
+          Write-Host "  Same-directory /studio/health response: $($sameHealth | ConvertTo-Json -Compress)"
+          if ($sameHealth.ok -ne $true) {
+            Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Same-directory reuse test failed: /studio/health.ok must be true, got: $($sameHealth.ok)"
+          }
+          if ($sameHealth.backendReady -ne $true) {
+            Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Same-directory reuse test failed: /studio/health.backendReady must be true, got: $($sameHealth.backendReady)"
+          }
+          if ($sameHealth.localStatus -ne "现有本机 NBL 服务已运行") {
+            Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Same-directory reuse test failed: localStatus must be '现有本机 NBL 服务已运行', got: $($sameHealth.localStatus)"
+          }
+          Write-Host "  [OK] Same-directory service successfully recognized as reusable (ok=true, backendReady=true)."
+
+          # Assert same-directory /api/status proxies through (returns 401 without auth token, confirming proxy forwarding)
+          $proxyThrough = $false
+          try {
+            $sameApiReq = Invoke-WebRequest -Uri "http://127.0.0.1:9736/api/status" -SkipHttpErrorCheck -TimeoutSec 5
+            Write-Host "  Same-directory /api/status HTTP status: $($sameApiReq.StatusCode)"
+            if ($sameApiReq.StatusCode -eq 401) {
+              $proxyThrough = $true
+            }
+          } catch {
+            if ($_.Exception.Response.StatusCode.value__ -eq 401) {
+              $proxyThrough = $true
+            }
+          }
+          if (-not $proxyThrough) {
+            Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
+            throw "Same-directory reuse test failed: /api/status did not forward to backend (expected HTTP 401)!"
+          }
+          Write-Host "  [OK] Same-directory proxy correctly forwards requests to the running backend."
+
+          # Clean up same-directory launcher
+          Stop-Process -Id $devStudioApp.Id -Force -ErrorAction SilentlyContinue
+
+          # 12G. Stop dev backend cleanly with STOP_LOCAL.ps1
+          Write-Host "  --- 12G. Stopping dev backend with STOP_LOCAL.ps1 ---"
           & "$devRoot\STOP_LOCAL.ps1"
           Start-Sleep -Seconds 2
           if (-not $devProc.HasExited) {
