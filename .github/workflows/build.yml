@@ -70,6 +70,7 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.23'
+          cache: false
 
       - name: Setup Python 3.12
         uses: actions/setup-python@v5
@@ -88,7 +89,13 @@ jobs:
         run: npm ci
 
       - name: Run Node Unit Tests
-        run: npm test
+        run: |
+          $testFiles = (Get-ChildItem "test\*.test.mjs").FullName
+          if (-not $testFiles) {
+            throw "No test files found in test directory!"
+          }
+          Write-Host "Running $($testFiles.Count) Node unit test files..."
+          node --test $testFiles
 
       - name: Run Go Desktop Unit Tests
         working-directory: desktop
