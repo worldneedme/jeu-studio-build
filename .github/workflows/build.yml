@@ -158,7 +158,7 @@ jobs:
           # 6. Copy complete nbl source, scripts, web assets, and node_modules
           $nblFiles = @(
             "package.json", "package-lock.json", "server.mjs", "batch.mjs",
-            "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
+            "profile-utils.mjs", "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
             "archive-utils.mjs", "batch-safety.mjs", "quota-policy.mjs",
             "capture-session.mjs", "browser-session.sh", "run.sh",
             "requirements.txt", "prompts.txt", "README.md", "DEPLOY.md"
@@ -223,6 +223,7 @@ jobs:
             "D:\JEU-Studio\runtime\ffmpeg\bin\ffprobe.exe",
             "D:\JEU-Studio\runtime\python\python.exe",
             "D:\JEU-Studio\nbl\server.mjs",
+            "D:\JEU-Studio\nbl\profile-utils.mjs",
             "D:\JEU-Studio\nbl\capture-session.mjs",
             "D:\JEU-Studio\nbl\public\index.html"
           )
@@ -360,6 +361,7 @@ jobs:
           Set-Content -Path "D:\JEU-Studio\data\webconfig.json" -Value $webCfg -Encoding UTF8
 
           Write-Host "8. Testing desktop app launch and local backend in clean environment..."
+          $env:NBL_TEST_BROWSER_STUB = "1"
           $app = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "-no-open -port 9733" -PassThru
 
           Write-Host "Polling /studio/health endpoint..."
@@ -416,6 +418,42 @@ jobs:
             throw "Authenticated /api/status did not return ok: true! (Received: $($apiResp | ConvertTo-Json -Compress))"
           }
           Write-Host "  [OK] Authenticated /api/status returned HTTP 200 and ok: true"
+
+          Write-Host "10B. Verifying Issue #3: Safe profile directory resolution & browser login API..."
+          if (-not $apiResp.paths -or -not $apiResp.paths.profileDir) {
+            throw "Issue #3 verification failed: /api/status does not contain paths.profileDir!"
+          }
+          Write-Host "  Reported profileDir: $($apiResp.paths.profileDir)"
+          if ($apiResp.paths.profileDir -ne "D:\JEU-Studio\sessions\chrome-profile") {
+            throw "Issue #3 verification failed: profileDir is '$($apiResp.paths.profileDir)', expected 'D:\JEU-Studio\sessions\chrome-profile'!"
+          }
+
+          # Test /api/browser/start execution without ENOENT
+          $browserStartResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          if (-not $browserStartResp.ok) {
+            throw "Issue #3 verification failed: /api/browser/start failed with error: $($browserStartResp.error)"
+          }
+          Write-Host "  [OK] /api/browser/start succeeded without ENOENT: $($browserStartResp | ConvertTo-Json -Compress)"
+
+          # Test data preservation: write canary file to profile directory
+          $canaryPath = "D:\JEU-Studio\sessions\chrome-profile\canary.txt"
+          Set-Content -Path $canaryPath -Value "JEU_STUDIO_CANARY_TEST_123" -Encoding UTF8
+          $canaryHashBefore = (Get-FileHash $canaryPath -Algorithm SHA256).Hash
+
+          # Call start again (idempotent call)
+          $browserStartAgain = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          if (-not $browserStartAgain.ok) {
+            throw "Issue #3 verification failed: idempotent /api/browser/start failed!"
+          }
+          $canaryHashAfter = (Get-FileHash $canaryPath -Algorithm SHA256).Hash
+          if ($canaryHashBefore -ne $canaryHashAfter) {
+            throw "Issue #3 verification failed: canary file in profile directory was corrupted or overwritten!"
+          }
+          Write-Host "  [OK] Profile directory data preservation verified (canary hash intact: $canaryHashAfter)"
+
+          # Call stop
+          $browserStopResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/stop" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
+          Write-Host "  [OK] /api/browser/stop succeeded: $($browserStopResp | ConvertTo-Json -Compress)"
 
           Write-Host "Verifying auto-generated data/config.json..."
           if (-not (Test-Path "D:\JEU-Studio\data\config.json")) {
