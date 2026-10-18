@@ -90,6 +90,18 @@ jobs:
 
       - name: Run Node Unit Tests
         run: |
+          Write-Host "Verifying syntax of all ES modules with node --check..."
+          Get-ChildItem -Filter "*.mjs" | ForEach-Object {
+            Write-Host "  Checking $($_.Name)..."
+            node --check $_.FullName
+          }
+          Write-Host "Testing capture-session.mjs module loading..."
+          $captureRes = node capture-session.mjs 2>&1
+          if ($captureRes -match "ReferenceError" -or $captureRes -match "SyntaxError") {
+            throw "capture-session.mjs failed module loading test: $captureRes"
+          }
+          Write-Host "  capture-session.mjs module loading verified."
+
           $testFiles = (Get-ChildItem "test\*.test.mjs").FullName
           if (-not $testFiles) {
             throw "No test files found in test directory!"
@@ -420,6 +432,7 @@ jobs:
           Write-Host "  [OK] Authenticated /api/status returned HTTP 200 and ok: true"
 
           Write-Host "10B. Verifying Issue #3: Safe profile directory resolution & browser login API..."
+          Write-Host "  (Note: NBL_TEST_BROWSER_STUB verifies directory resolution, recursive creation and API routing; it does NOT claim real Chrome or Google login completion.)"
           if (-not $apiResp.paths -or -not $apiResp.paths.profileDir) {
             throw "Issue #3 verification failed: /api/status does not contain paths.profileDir!"
           }
@@ -428,12 +441,25 @@ jobs:
             throw "Issue #3 verification failed: profileDir is '$($apiResp.paths.profileDir)', expected 'D:\JEU-Studio\sessions\chrome-profile'!"
           }
 
+          # Ensure isolated test profile and parent directory do NOT exist before calling browser/start
+          # to strictly verify that recursive creation succeeds without ENOENT
+          if (Test-Path "D:\JEU-Studio\sessions") {
+            Remove-Item -Recurse -Force "D:\JEU-Studio\sessions"
+          }
+          if (Test-Path "D:\JEU-Studio\sessions") {
+            throw "Failed to clean sessions parent directory before test!"
+          }
+          Write-Host "  [Verified] Parent directory 'D:\JEU-Studio\sessions' confirmed non-existent prior to launch."
+
           # Test /api/browser/start execution without ENOENT
           $browserStartResp = Invoke-RestMethod -Uri "http://127.0.0.1:9733/api/browser/start" -Method Post -Headers @{ "x-auth" = $loginResp.token } -TimeoutSec 5
           if (-not $browserStartResp.ok) {
             throw "Issue #3 verification failed: /api/browser/start failed with error: $($browserStartResp.error)"
           }
-          Write-Host "  [OK] /api/browser/start succeeded without ENOENT: $($browserStartResp | ConvertTo-Json -Compress)"
+          if (-not (Test-Path "D:\JEU-Studio\sessions\chrome-profile")) {
+            throw "Issue #3 verification failed: /api/browser/start did not create D:\JEU-Studio\sessions\chrome-profile!"
+          }
+          Write-Host "  [OK] /api/browser/start safely created profile and parent directories without ENOENT: $($browserStartResp | ConvertTo-Json -Compress)"
 
           # Test data preservation: write canary file to profile directory
           $canaryPath = "D:\JEU-Studio\sessions\chrome-profile\canary.txt"
