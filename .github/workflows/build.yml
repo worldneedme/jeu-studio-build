@@ -706,6 +706,31 @@ jobs:
           if (-not $postUpgradeHealthy) {
             throw "Upgrade test failed: replacement JEUStudio.exe did not start successfully."
           }
+
+          # Verify custom password in webconfig.json preserved across upgrade
+          $postUpgradeWebCfg = Get-Content "D:\JEU-Studio\data\webconfig.json" -Raw | ConvertFrom-Json
+          if ($postUpgradeWebCfg.password -ne $testPassword) {
+            throw "Upgrade test failed: custom password in webconfig.json was not preserved across upgrade!"
+          }
+          Write-Host "  [OK] Custom password in webconfig.json preserved across upgrade."
+
+          # Verify post-upgrade backend rejects unauthenticated request with 401 and accepts preserved password
+          $postUpgradeAuthOk = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $postLoginResp = Invoke-RestMethod -Uri "http://127.0.0.1:9734/api/login" -Method Post -Body (@{ password = $testPassword } | ConvertTo-Json) -ContentType "application/json" -TimeoutSec 5
+              if ($postLoginResp.ok -and $postLoginResp.token) {
+                $postUpgradeAuthOk = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $postUpgradeAuthOk) {
+            throw "Upgrade test failed: preserved custom password failed to authenticate on upgraded instance!"
+          }
+          Write-Host "  [OK] Authenticated successfully post-upgrade with preserved custom password."
+
           & $winPs -NoProfile -ExecutionPolicy Bypass -File "D:\JEU-Studio\STOP_LOCAL.ps1"
           if ($LASTEXITCODE -ne 0) {
             throw "Post-upgrade STOP_LOCAL.ps1 failed with exit code $LASTEXITCODE under Windows PowerShell 5.1!"
