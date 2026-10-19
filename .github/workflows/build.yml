@@ -576,6 +576,49 @@ jobs:
           }
           Write-Host "  [OK] D:\JEU-Studio\data\config.json initialized."
 
+          Write-Host "10C. Verifying queue lifecycle, worker fast-exit fix, honest error rendering and progress in installed app..."
+          $edgeProfileDir2 = "$env:RUNNER_TEMP\edge-cdp-profile-queue"
+          if (Test-Path $edgeProfileDir2) { Remove-Item -Recurse -Force $edgeProfileDir2 -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Path $edgeProfileDir2 -Force | Out-Null
+
+          $edgeProc2 = Start-Process -FilePath $edgeExe -ArgumentList @(
+            "--headless=new",
+            "--remote-debugging-port=9222",
+            "--remote-debugging-address=127.0.0.1",
+            "--user-data-dir=$edgeProfileDir2",
+            "http://127.0.0.1:9733"
+          ) -PassThru
+          Write-Host "  Headless Edge for queue lifecycle test started with PID: $($edgeProc2.Id)"
+
+          # Wait for CDP endpoint to respond
+          $cdpReady = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $cdpCheck = Invoke-RestMethod -Uri "http://127.0.0.1:9222/json" -TimeoutSec 2 -ErrorAction Stop
+              if ($cdpCheck -and $cdpCheck.Count -gt 0) {
+                $cdpReady = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $cdpReady) {
+            Stop-Process -Id $edgeProc2.Id -Force -ErrorAction SilentlyContinue
+            throw "Headless Edge failed to bind CDP port 9222 for queue lifecycle test!"
+          }
+
+          & "D:\JEU-Studio\runtime\node\node.exe" "D:\JEU-Studio\nbl\test\installed-queue-lifecycle.mjs" --port 9733 --cdp-port 9222 --token $loginResp.token
+          $queueTestExit = $LASTEXITCODE
+
+          Stop-Process -Id $edgeProc2.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 1
+          Remove-Item -Recurse -Force $edgeProfileDir2 -ErrorAction SilentlyContinue
+
+          if ($queueTestExit -ne 0) {
+            throw "Installed queue lifecycle test failed with exit code $queueTestExit!"
+          }
+          Write-Host "  [OK] Installed queue lifecycle and worker verification PASSED."
+
           Write-Host "11. Positive test: stopping verified JEU Studio service with STOP_LOCAL.ps1 using Windows PowerShell 5.1..."
           $backendPid = $null
           if (Test-Path "D:\JEU-Studio\data\local-server.pid.json") {
