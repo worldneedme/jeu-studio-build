@@ -187,6 +187,9 @@ jobs:
           if (Test-Path "public") {
             Copy-Item -Recurse "public" "$bundle\nbl\public" -Force
           }
+          if (Test-Path "test") {
+            Copy-Item -Recurse "test" "$bundle\nbl\test" -Force
+          }
           Copy-Item -Recurse "node_modules" "$bundle\nbl\node_modules" -Force
 
           Write-Host "Release bundle packaged successfully into package/."
@@ -442,6 +445,66 @@ jobs:
           if (-not $unauth401) {
             throw "Unauthenticated request to /api/status did not return HTTP 401 within timeout!"
           }
+
+          Write-Host "9B. Verifying installed executable's UI and browser-level DOM execution..."
+          $edgeExe = (Get-Command msedge.exe -ErrorAction SilentlyContinue)?.Source
+          if (-not $edgeExe) {
+            $candidatePaths = @(
+              "${env:ProgramFiles(x86)}\Microsoft\Edge\Application\msedge.exe",
+              "$env:ProgramFiles\Microsoft\Edge\Application\msedge.exe"
+            )
+            foreach ($p in $candidatePaths) {
+              if (Test-Path $p) { $edgeExe = $p; break }
+            }
+          }
+          if (-not $edgeExe) {
+            throw "Microsoft Edge executable (msedge.exe) not found for browser-level DOM verification!"
+          }
+          Write-Host "  Found Edge at: $edgeExe"
+
+          $edgeProfileDir = "$env:RUNNER_TEMP\edge-cdp-profile"
+          if (Test-Path $edgeProfileDir) { Remove-Item -Recurse -Force $edgeProfileDir -ErrorAction SilentlyContinue }
+          New-Item -ItemType Directory -Path $edgeProfileDir -Force | Out-Null
+
+          $edgeProc = Start-Process -FilePath $edgeExe -ArgumentList @(
+            "--headless=new",
+            "--remote-debugging-port=9222",
+            "--remote-debugging-address=127.0.0.1",
+            "--user-data-dir=$edgeProfileDir",
+            "http://127.0.0.1:9733"
+          ) -PassThru
+          Write-Host "  Headless Edge started with PID: $($edgeProc.Id)"
+
+          # Wait for CDP endpoint to respond
+          $cdpReady = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $cdpCheck = Invoke-RestMethod -Uri "http://127.0.0.1:9222/json" -TimeoutSec 2 -ErrorAction Stop
+              if ($cdpCheck -and $cdpCheck.Count -gt 0) {
+                $cdpReady = $true
+                break
+              }
+            } catch {}
+          }
+          if (-not $cdpReady) {
+            Stop-Process -Id $edgeProc.Id -Force -ErrorAction SilentlyContinue
+            throw "Headless Edge failed to bind CDP port 9222 within 30 seconds!"
+          }
+
+          # Run browser-level DOM execution test using bundled node against installed tree
+          & "D:\JEU-Studio\runtime\node\node.exe" "D:\JEU-Studio\nbl\test\installed-ui-login.mjs" --port 9733 --cdp-port 9222 --password $testPassword
+          $uiTestExit = $LASTEXITCODE
+
+          # Stop headless Edge cleanly
+          Stop-Process -Id $edgeProc.Id -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 1
+          Remove-Item -Recurse -Force $edgeProfileDir -ErrorAction SilentlyContinue
+
+          if ($uiTestExit -ne 0) {
+            throw "Browser-level DOM execution test against installed JEUStudio.exe failed with exit code $uiTestExit!"
+          }
+          Write-Host "  [OK] Browser-level DOM execution test against installed JEUStudio.exe PASSED."
 
           Write-Host "10. Authenticating via /api/login and verifying authenticated /api/status..."
           $loginBody = @{ password = $testPassword } | ConvertTo-Json
