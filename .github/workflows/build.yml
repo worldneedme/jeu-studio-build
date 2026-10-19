@@ -170,7 +170,7 @@ jobs:
           # 6. Copy complete nbl source, scripts, web assets, and node_modules
           $nblFiles = @(
             "package.json", "package-lock.json", "server.mjs", "batch.mjs",
-            "profile-utils.mjs", "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
+            "profile-utils.mjs", "chrome-runtime.mjs", "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
             "archive-utils.mjs", "batch-safety.mjs", "quota-policy.mjs",
             "capture-session.mjs", "browser-session.sh", "run.sh",
             "requirements.txt", "prompts.txt", "README.md", "DEPLOY.md"
@@ -239,6 +239,7 @@ jobs:
             "D:\JEU-Studio\runtime\python\python.exe",
             "D:\JEU-Studio\nbl\server.mjs",
             "D:\JEU-Studio\nbl\profile-utils.mjs",
+            "D:\JEU-Studio\nbl\chrome-runtime.mjs",
             "D:\JEU-Studio\nbl\capture-session.mjs",
             "D:\JEU-Studio\nbl\public\index.html"
           )
