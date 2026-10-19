@@ -58,6 +58,16 @@ jobs:
           components: rustfmt, clippy
           targets: x86_64-pc-windows-msvc
 
+      - name: Generate Cargo.lock on hosted runner (temporary)
+        run: |
+          cargo update --manifest-path rust/Cargo.toml
+          $encoded = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes("rust/Cargo.lock"))
+          Write-Host "CARGO_LOCK_B64_START"
+          for ($i = 0; $i -lt $encoded.Length; $i += 120) {
+            Write-Host $encoded.Substring($i, [Math]::Min(120, $encoded.Length - $i))
+          }
+          Write-Host "CARGO_LOCK_B64_END"
+
       - name: Verify Formatting (cargo fmt --check)
         run: |
           Write-Host "Running cargo fmt --check..."
