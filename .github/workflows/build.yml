@@ -222,6 +222,7 @@ jobs:
           Get-Item JEUStudio-Windows-x64.zip | Select-Object Name, Length
 
       - name: Verify Windows Installation to D:\JEU-Studio & Bundled Runtime
+        timeout-minutes: 12
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host "=========================================="
