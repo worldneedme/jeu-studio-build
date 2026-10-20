@@ -130,6 +130,7 @@ jobs:
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\node"
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\ffmpeg\bin"
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\python"
+          New-Item -ItemType Directory -Force -Path "$bundle\runtime\rclone"
           New-Item -ItemType Directory -Force -Path "$bundle\runtime\pyvenv\Scripts"
           New-Item -ItemType Directory -Force -Path "$bundle\nbl"
           New-Item -ItemType Directory -Force -Path "$bundle\data"
@@ -152,6 +153,21 @@ jobs:
           }
           Write-Host "  Bundled standalone FFmpeg binary: $ffmpegSize bytes"
 
+          # Official Windows rclone; the pinned ZIP hash is from the rclone release checksums.
+          $rcloneVersion = 'v1.68.2'
+          $rcloneArchive = "rclone-$rcloneVersion-windows-amd64.zip"
+          $rcloneZip = Join-Path $env:RUNNER_TEMP $rcloneArchive
+          Invoke-WebRequest -Uri "https://downloads.rclone.org/$rcloneVersion/$rcloneArchive" -OutFile $rcloneZip
+          $rcloneHash = (Get-FileHash $rcloneZip -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($rcloneHash -ne '812bf76cc02c04cf6327f3683f3d5a88e47d36c39db84c1a745777496be7d993') {
+            throw "rclone archive SHA256 mismatch: $rcloneHash"
+          }
+          $rcloneExtract = Join-Path $env:RUNNER_TEMP 'jeu-rclone-extract'
+          Expand-Archive -Path $rcloneZip -DestinationPath $rcloneExtract -Force
+          Copy-Item (Join-Path $rcloneExtract "rclone-$rcloneVersion-windows-amd64\rclone.exe") "$bundle\runtime\rclone\rclone.exe"
+          & "$bundle\runtime\rclone\rclone.exe" version
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled rclone failed to start' }
+
           # 4. Bundle standalone Python 3.12 environment with dependencies
           $pyRoot = Split-Path -Parent (Get-Command python).Source
           Copy-Item "$pyRoot\python.exe" "$bundle\runtime\python\python.exe"
@@ -171,7 +187,7 @@ jobs:
           $nblFiles = @(
             "package.json", "package-lock.json", "server.mjs", "batch.mjs",
             "profile-utils.mjs", "chrome-runtime.mjs", "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
-            "archive-utils.mjs", "batch-safety.mjs", "quota-policy.mjs",
+            "archive-utils.mjs", "batch-safety.mjs", "quota-policy.mjs", "shared-cdp-page.mjs",
             "capture-session.mjs", "browser-session.sh", "run.sh",
             "requirements.txt", "prompts.txt", "README.md", "DEPLOY.md"
           )
@@ -237,9 +253,11 @@ jobs:
             "D:\JEU-Studio\runtime\ffmpeg\bin\ffmpeg.exe",
             "D:\JEU-Studio\runtime\ffmpeg\bin\ffprobe.exe",
             "D:\JEU-Studio\runtime\python\python.exe",
+            "D:\JEU-Studio\runtime\rclone\rclone.exe",
             "D:\JEU-Studio\nbl\server.mjs",
             "D:\JEU-Studio\nbl\profile-utils.mjs",
             "D:\JEU-Studio\nbl\chrome-runtime.mjs",
+            "D:\JEU-Studio\nbl\shared-cdp-page.mjs",
             "D:\JEU-Studio\nbl\capture-session.mjs",
             "D:\JEU-Studio\nbl\public\index.html"
           )
@@ -281,9 +299,11 @@ jobs:
           $testNode = Get-Command node -ErrorAction SilentlyContinue
           $testPython = Get-Command python -ErrorAction SilentlyContinue
           $testFFmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+          $testRclone = Get-Command rclone -ErrorAction SilentlyContinue
           Write-Host "  node on PATH: $($testNode -eq $null)"
           Write-Host "  python on PATH: $($testPython -eq $null)"
           Write-Host "  ffmpeg on PATH: $($testFFmpeg -eq $null)"
+          if ($testRclone) { throw 'Clean PATH still resolves external rclone' }
 
           Write-Host "4. Testing bundled isolated runtimes directly..."
           $nodeVer = & "D:\JEU-Studio\runtime\node\node.exe" --version
@@ -292,6 +312,8 @@ jobs:
           Write-Host "  Bundled FFmpeg: $ffmpegVer"
           $pyVer = & "D:\JEU-Studio\runtime\python\python.exe" --version
           Write-Host "  Bundled Python: $pyVer"
+          & "D:\JEU-Studio\runtime\node\node.exe" "D:\JEU-Studio\nbl\test\installed-rclone.mjs"
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled rclone offline archive smoke test failed' }
 
           Write-Host "5. Testing offline audio conversion and Python subtitle FFmpeg resolution..."
           New-Item -ItemType Directory -Force -Path "D:\JEU-Studio\data"
