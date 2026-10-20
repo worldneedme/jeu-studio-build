@@ -107,7 +107,7 @@ jobs:
             throw "No test files found in test directory!"
           }
           Write-Host "Running $($testFiles.Count) Node unit test files..."
-          node --test $testFiles
+          node --test --test-concurrency=1 $testFiles
 
       - name: Run Go Desktop Unit Tests
         working-directory: desktop
