@@ -327,6 +327,11 @@ jobs:
 
           & "D:\JEU-Studio\runtime\python\python.exe" -c "import sys, os; sys.path.insert(0, r'D:\JEU-Studio\nbl'); import audio_to_srt; f = audio_to_srt.resolve_ffmpeg_bin(); print('Resolved FFmpeg in Python:', f); assert os.path.isfile(f), f'FFmpeg not found: {f}'; assert 'runtime' in f.lower(), 'FFmpeg was not resolved to bundled runtime!'"
           Write-Host "  [OK] Python subtitle script and bundled FFmpeg resolution verified."
+          $env:PYTHONIOENCODING = 'cp1252'
+          & "D:\JEU-Studio\runtime\python\python.exe" -c "import sys; sys.path.insert(0, r'D:\JEU-Studio\nbl'); import audio_to_srt; audio_to_srt.configure_unicode_output(); print('必剪字幕 UTF-8')"
+          if ($LASTEXITCODE -ne 0) { throw 'Bundled Python failed to emit Chinese subtitle diagnostics under cp1252 startup' }
+          Remove-Item Env:PYTHONIOENCODING
+          Write-Host "  [OK] Bundled Python Unicode diagnostic output verified under legacy Windows encoding."
 
           Write-Host "6. Negative tests for STOP_LOCAL.ps1..."
           Write-Host "6A. Negative test: PID reuse / creation time check (real server.mjs on port 9655, stale startedAt)..."
