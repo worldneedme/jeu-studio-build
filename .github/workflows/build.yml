@@ -427,6 +427,7 @@ jobs:
 
           Write-Host "8. Testing desktop app launch and local backend in clean environment..."
           $env:NBL_TEST_BROWSER_STUB = "1"
+          $env:NBL_TEST_SRT_STUB = "1"
           $app = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "-no-open -port 9733" -PassThru
 
           Write-Host "Polling /studio/health endpoint..."
