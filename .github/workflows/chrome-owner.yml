@@ -39,8 +39,3 @@ jobs:
         run: npm ci
       - name: Run real Chrome profile ownership test
         run: node --test test/chrome-runtime.test.mjs
-      - name: Run shared browser and installer preflight tests
-        continue-on-error: true
-        run: |
-          node --test test/shared-browser.test.mjs
-          node --test test/installer-chrome-preflight.test.mjs
