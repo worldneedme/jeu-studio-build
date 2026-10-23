@@ -205,21 +205,17 @@ jobs:
             Copy-Item $f.FullName "$bundle\nbl\" -Force
           }
 
-          # 打包后自检：server.mjs 里每个相对 import 都必须在 bundle 里存在。
-          # 用 Node 做自检：PowerShell 正则里同时含单双引号极易被截断，交给 Node 更稳。
-          $selfCheck = @'
-const fs=require('fs'),path=require('path');
-const b=process.argv[2];
-const src=fs.readFileSync(path.join(b,'server.mjs'),'utf8');
-const re=/(?:from|import)\s*\(?\s*['"](\.[^'"]+)['"]/g;
-const miss=[];let m;
-while((m=re.exec(src))){ const rel=m[1].slice(2);
-  if(!fs.existsSync(path.join(b,rel))) miss.push(rel); }
-if(miss.length){ console.error('MISSING: '+miss.join(', ')); process.exit(1); }
-console.log('PASS: every relative import of server.mjs exists in the bundle.');
-'@
-          $selfCheck | Out-File -Encoding utf8 selfcheck.cjs
-          node selfcheck.cjs "$bundle\nbl"
+          # 用 node -e 做自检：PowerShell 的内联正则同时含单双引号会被截断，
+          # 而 here-string 的结束符必须顶格、与 YAML 缩进冲突，故都不用。
+          $check = "const fs=require('fs'),path=require('path'),b=process.argv[1];" +
+                   "const s=fs.readFileSync(path.join(b,'server.mjs'),'utf8');" +
+                   "const re=/(?:from|import)\s*\(?\s*[\x27\x22](\.[^\x27\x22]+)[\x27\x22]/g;" +
+                   "const miss=[];let m;" +
+                   "while((m=re.exec(s))){const r=m[1].slice(2);" +
+                   "if(!fs.existsSync(path.join(b,r)))miss.push(r);}" +
+                   "if(miss.length){console.error('MISSING: '+miss.join(', '));process.exit(1);}" +
+                   "console.log('PASS: every relative import of server.mjs exists.');"
+          node -e $check "$bundle\nbl"
           if ($LASTEXITCODE -ne 0) { throw 'Bundle self-check failed' }
           if (Test-Path "scripts") {
             Copy-Item -Recurse "scripts" "$bundle\nbl\scripts" -Force
