@@ -127,7 +127,7 @@ jobs:
         working-directory: rust/crates/jeu-studio-native
         run: |
           cargo build --locked --release
-          Get-Item target/release/jeu-studio-native.exe | Select-Object Name, Length
+          Get-Item ../../target/release/jeu-studio-native.exe | Select-Object Name, Length
 
       - name: Package Release Bundle with Portable Runtimes & Dependencies
         run: |
@@ -192,7 +192,7 @@ jobs:
           Copy-Item "STOP_LOCAL.ps1" "$bundle\"
           Copy-Item "config.json" "$bundle\"
           # 5b. Rust 原生二进制（R1-R6：生命周期/队列/字幕/RPC 适配）
-          Copy-Item "rust\crates\jeu-studio-native\target\release\jeu-studio-native.exe" "$bundle\nbl\jeu-studio-native.exe" -Force
+          Copy-Item "rust\target\release\jeu-studio-native.exe" "$bundle\nbl\jeu-studio-native.exe" -Force
 
           # 6. Copy complete nbl source, scripts, web assets, and node_modules
           # 显式清单只保留非 .mjs 的资源文件。
