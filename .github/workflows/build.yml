@@ -184,16 +184,38 @@ jobs:
           Copy-Item "config.json" "$bundle\"
 
           # 6. Copy complete nbl source, scripts, web assets, and node_modules
+          # 显式清单只保留非 .mjs 的资源文件。
+          # .mjs 一律由下面的通配自动收集 —— 之前是手工清单，新增模块忘加一次
+          # 就会产出「装得上但起不来」的安装包（2026-10-23 的 zip-utils.mjs 就是）。
           $nblFiles = @(
-            "package.json", "package-lock.json", "server.mjs", "batch.mjs",
-            "profile-utils.mjs", "chrome-runtime.mjs", "video-subtitles.mjs", "audio_to_srt.py", "bcut_asr.py", "config.json",
-            "archive-utils.mjs", "batch-safety.mjs", "quota-policy.mjs", "shared-cdp-page.mjs",
-            "capture-session.mjs", "browser-session.sh", "run.sh",
+            "package.json", "package-lock.json",
+            "audio_to_srt.py", "bcut_asr.py", "config.json",
+            "browser-session.sh", "run.sh",
             "requirements.txt", "prompts.txt", "README.md", "DEPLOY.md"
           )
           foreach ($f in $nblFiles) {
             if (Test-Path $f) { Copy-Item $f "$bundle\nbl\" -Force }
           }
+
+          # 根目录所有 .mjs 全量收集，避免手写清单漏项。
+          $mjsFiles = Get-ChildItem -Path . -Filter *.mjs -File
+          Write-Host "Packaging $($mjsFiles.Count) .mjs modules:"
+          foreach ($f in $mjsFiles) {
+            Write-Host "  - $($f.Name)"
+            Copy-Item $f.FullName "$bundle\nbl\" -Force
+          }
+
+          # 打包后自检：server.mjs 里每个相对 import 都必须在 bundle 里存在。
+          $serverSrc = Get-Content "$bundle\nbl\server.mjs" -Raw
+          $missing = @()
+          foreach ($m in [regex]::Matches($serverSrc, "(?:from|import)\s+['"](\./[^'"]+)['"]")) {
+            $rel = $m.Groups[1].Value -replace '^\./', ''
+            if (-not (Test-Path (Join-Path "$bundle\nbl" $rel))) { $missing += $rel }
+          }
+          if ($missing.Count -gt 0) {
+            throw "Bundle is missing modules imported by server.mjs: $($missing -join ', ')"
+          }
+          Write-Host "Bundle self-check passed: every ./ import of server.mjs exists."
           if (Test-Path "scripts") {
             Copy-Item -Recurse "scripts" "$bundle\nbl\scripts" -Force
           }
