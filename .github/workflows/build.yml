@@ -206,16 +206,21 @@ jobs:
           }
 
           # 打包后自检：server.mjs 里每个相对 import 都必须在 bundle 里存在。
-          $serverSrc = Get-Content "$bundle\nbl\server.mjs" -Raw
-          $missing = @()
-          foreach ($m in [regex]::Matches($serverSrc, "(?:from|import)\s+['"](\./[^'"]+)['"]")) {
-            $rel = $m.Groups[1].Value -replace '^\./', ''
-            if (-not (Test-Path (Join-Path "$bundle\nbl" $rel))) { $missing += $rel }
-          }
-          if ($missing.Count -gt 0) {
-            throw "Bundle is missing modules imported by server.mjs: $($missing -join ', ')"
-          }
-          Write-Host "Bundle self-check passed: every ./ import of server.mjs exists."
+          # 用 Node 做自检：PowerShell 正则里同时含单双引号极易被截断，交给 Node 更稳。
+          $selfCheck = @'
+const fs=require('fs'),path=require('path');
+const b=process.argv[2];
+const src=fs.readFileSync(path.join(b,'server.mjs'),'utf8');
+const re=/(?:from|import)\s*\(?\s*['"](\.[^'"]+)['"]/g;
+const miss=[];let m;
+while((m=re.exec(src))){ const rel=m[1].slice(2);
+  if(!fs.existsSync(path.join(b,rel))) miss.push(rel); }
+if(miss.length){ console.error('MISSING: '+miss.join(', ')); process.exit(1); }
+console.log('PASS: every relative import of server.mjs exists in the bundle.');
+'@
+          $selfCheck | Out-File -Encoding utf8 selfcheck.cjs
+          node selfcheck.cjs "$bundle\nbl"
+          if ($LASTEXITCODE -ne 0) { throw 'Bundle self-check failed' }
           if (Test-Path "scripts") {
             Copy-Item -Recurse "scripts" "$bundle\nbl\scripts" -Force
           }
