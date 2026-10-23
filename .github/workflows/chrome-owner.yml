@@ -38,4 +38,7 @@ jobs:
       - name: Install locked dependencies
         run: npm ci
       - name: Run real Chrome profile ownership test
-        run: node --test test/chrome-runtime.test.mjs
+        run: |
+          node --test test/chrome-runtime.test.mjs
+          node --test test/shared-browser.test.mjs
+          node --test test/installer-chrome-preflight.test.mjs
