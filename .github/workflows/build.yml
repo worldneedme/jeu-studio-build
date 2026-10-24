@@ -129,6 +129,34 @@ jobs:
           cargo build --locked --release
           Get-Item ../../target/release/jeu-studio-native.exe | Select-Object Name, Length
 
+      # Native WebView2 window (desktop-window/, separate Cargo workspace). Older
+      # source commits without it are skipped. Until desktop-window/Cargo.lock is
+      # committed, the lockfile is generated here and uploaded for review.
+      - name: Test & Build Native Window (JEUStudioWindow.exe)
+        if: ${{ hashFiles('desktop-window/Cargo.toml') != '' }}
+        working-directory: desktop-window
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (Test-Path Cargo.lock) { $lockArgs = @('--locked') } else {
+            Write-Warning 'desktop-window/Cargo.lock missing; generating it on this hosted runner.'
+            cargo generate-lockfile
+            if ($LASTEXITCODE -ne 0) { throw 'cargo generate-lockfile failed' }
+            $lockArgs = @()
+          }
+          cargo test @lockArgs --release
+          if ($LASTEXITCODE -ne 0) { throw 'desktop-window tests failed' }
+          cargo build @lockArgs --release
+          if ($LASTEXITCODE -ne 0) { throw 'desktop-window build failed' }
+          Get-Item target/release/JEUStudioWindow.exe | Select-Object Name, Length
+
+      - name: Upload Native Window Cargo.lock
+        if: ${{ hashFiles('desktop-window/Cargo.toml') != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-window-cargo-lock
+          path: desktop-window/Cargo.lock
+          retention-days: 7
+
       - name: Package Release Bundle with Portable Runtimes & Dependencies
         run: |
           $ErrorActionPreference = 'Stop'
@@ -189,6 +217,10 @@ jobs:
 
           # 5. Copy desktop shell, scripts, and runtime assets
           Copy-Item "JEUStudio.exe" "$bundle\"
+          if (Test-Path "desktop-window\target\release\JEUStudioWindow.exe") {
+            Copy-Item "desktop-window\target\release\JEUStudioWindow.exe" "$bundle\"
+            Write-Host "  Bundled native WebView2 window JEUStudioWindow.exe."
+          }
           Copy-Item "STOP_LOCAL.ps1" "$bundle\"
           Copy-Item "config.json" "$bundle\"
           # 5b. Rust 原生二进制（R1-R6：生命周期/队列/字幕/RPC 适配）
@@ -1230,6 +1262,33 @@ jobs:
             throw "Corrupted config test failed: original corrupted file bytes were modified!"
           }
           Write-Host "  [OK] Corrupted webconfig.json failed closed (process exited code $($corruptProc.ExitCode), port closed, file bytes untouched)."
+
+      - name: Smoke Test Installed Native Window (WebView2)
+        if: ${{ hashFiles('desktop-window/Cargo.toml') != '' }}
+        timeout-minutes: 4
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $windowExe = "D:\JEU-Studio\JEUStudioWindow.exe"
+          if (-not (Test-Path $windowExe)) { throw "Installer did not deliver $windowExe" }
+          $wv2 = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
+          Write-Host "WebView2 Runtime: $($wv2.pv)"
+          $studio = Start-Process -FilePath "D:\JEU-Studio\JEUStudio.exe" -ArgumentList "-no-open","-port","9738" -WorkingDirectory "D:\JEU-Studio" -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 60; $i++) {
+              Start-Sleep -Milliseconds 500
+              try { $h = Invoke-RestMethod -Uri "http://127.0.0.1:9738/studio/health" -TimeoutSec 2; if ($h.application -eq 'JEU Studio') { $ready = $true; break } } catch {}
+            }
+            if (-not $ready) { throw 'JEUStudio.exe UI server did not start on 9738' }
+            # Exit 0: WebView2 created, page loaded and IPC posted a title containing "JEU Studio".
+            # Exit 2: timeout. Exit 3: wrong page. Exit 1: WebView2 could not be created.
+            $win = Start-Process -FilePath $windowExe -ArgumentList "--url","http://127.0.0.1:9738","--smoke-seconds","60" -PassThru -Wait
+            Write-Host "JEUStudioWindow.exe smoke exit code: $($win.ExitCode)"
+            if ($win.ExitCode -ne 0) { throw "Native window smoke test failed with exit code $($win.ExitCode)" }
+            Write-Host "  [OK] Installed native window loaded the console UI through WebView2 and IPC."
+          } finally {
+            Stop-Process -Id $studio.Id -Force -ErrorAction SilentlyContinue
+          }
 
       - name: Calculate Checksums for Installer and Portable Zip
         run: |
