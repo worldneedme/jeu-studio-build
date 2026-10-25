@@ -51,11 +51,14 @@ jobs:
       - name: Install, compile and unit-test
         working-directory: client
         run: |
-          npm ci --ignore-scripts
+          # Upstream's lockfile is out of sync with its package.json (npm ci fails),
+          # so resolve here and keep the refreshed lockfile as an artifact.
+          npm install --ignore-scripts --no-audit --no-fund
+          mkdir -p ../out
+          cp package-lock.json ../out/client-package-lock.json
           npx tsc
           npx vitest run
           npm pack --ignore-scripts
-          mkdir -p ../out
           mv notebooklm-client-*.tgz ../out/notebooklm-client-next.tgz
           sha256sum ../out/notebooklm-client-next.tgz
 
