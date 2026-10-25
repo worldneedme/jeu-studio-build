@@ -149,6 +149,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'desktop-window build failed' }
           Get-Item target/release/JEUStudioWindow.exe | Select-Object Name, Length
 
+      # Optional Authenticode signing. Configure repository secrets
+      # WINDOWS_SIGN_PFX_BASE64 + WINDOWS_SIGN_PFX_PASSWORD to enable; skipped otherwise.
+      - name: Sign App Executables (optional)
+        env:
+          SIGN_PFX: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
+        run: |
+          if (-not $env:SIGN_PFX) { Write-Host 'No signing certificate configured; executables stay unsigned.'; exit 0 }
+          $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object FullName -match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $signtool) { throw 'signtool.exe not found on the hosted runner' }
+          $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX))
+          try {
+            $targets = @('JEUStudio.exe', 'desktop-window\target\release\JEUStudioWindow.exe') | Where-Object { Test-Path $_ }
+            & $signtool.FullName sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f $pfx /p $env:SIGN_PASSWORD @targets
+            if ($LASTEXITCODE -ne 0) { throw 'signtool failed for app executables' }
+          } finally { Remove-Item $pfx -Force -ErrorAction SilentlyContinue }
+
       - name: Upload Native Window Cargo.lock
         if: ${{ hashFiles('desktop-window/Cargo.toml') != '' }}
         uses: actions/upload-artifact@v4
@@ -217,6 +235,9 @@ jobs:
 
           # 5. Copy desktop shell, scripts, and runtime assets
           Copy-Item "JEUStudio.exe" "$bundle\"
+          # Build identity for the in-app updater and diagnostics bundle.
+          @{ sourceSha = "${{ inputs.source_sha }}".Trim(); builtAt = (Get-Date).ToUniversalTime().ToString('o'); runId = "$env:GITHUB_RUN_ID" } |
+            ConvertTo-Json | Set-Content -Path "$bundle\build-info.json" -Encoding utf8NoBOM
           if (Test-Path "desktop-window\target\release\JEUStudioWindow.exe") {
             Copy-Item "desktop-window\target\release\JEUStudioWindow.exe" "$bundle\"
             Write-Host "  Bundled native WebView2 window JEUStudioWindow.exe."
@@ -277,9 +298,21 @@ jobs:
           Write-Host "Release bundle packaged successfully into package/."
 
       - name: Build Inno Setup Installer
+        env:
+          SIGN_PFX: ${{ secrets.WINDOWS_SIGN_PFX_BASE64 }}
+          SIGN_PASSWORD: ${{ secrets.WINDOWS_SIGN_PFX_PASSWORD }}
         run: |
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
           Move-Item -Path "dist\JEUStudio-Setup-x64.exe" -Destination ".\JEUStudio-Setup-x64.exe" -Force
+          if ($env:SIGN_PFX) {
+            $signtool = Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\bin" -Recurse -Filter signtool.exe | Where-Object FullName -match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+            $pfx = Join-Path $env:RUNNER_TEMP 'sign.pfx'
+            [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:SIGN_PFX))
+            try {
+              & $signtool.FullName sign /fd sha256 /tr http://timestamp.digicert.com /td sha256 /f $pfx /p $env:SIGN_PASSWORD JEUStudio-Setup-x64.exe
+              if ($LASTEXITCODE -ne 0) { throw 'signtool failed for the installer' }
+            } finally { Remove-Item $pfx -Force -ErrorAction SilentlyContinue }
+          }
           Get-Item JEUStudio-Setup-x64.exe | Select-Object Name, Length
 
       - name: Create Zip Package for Direct Portable Distribution
