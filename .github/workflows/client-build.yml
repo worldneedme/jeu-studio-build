@@ -1,0 +1,90 @@
+name: build-notebooklm-client
+
+# Builds the private worldneedme/notebooklm-client-jeu fork (TypeScript) on a
+# GitHub-hosted runner: tsc + unit tests + npm pack. Optionally regenerates the
+# private nbl package-lock.json against the packed tarball. Source is fetched
+# with read-only deploy keys and never stored in this public repository; only
+# the packed tarball / lockfile are kept as short-lived artifacts.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: 'notebooklm-client-jeu commit (40-char SHA)'
+        required: true
+        type: string
+      nbl_sha:
+        description: 'Optional nbl commit whose package-lock.json should be regenerated'
+        required: false
+        type: string
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  build-client:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate SHAs
+        run: |
+          for sha in "${{ inputs.source_sha }}" "${{ inputs.nbl_sha }}"; do
+            if [ -n "$sha" ] && ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then echo "Invalid SHA: $sha"; exit 1; fi
+          done
+
+      - name: Checkout client fork
+        uses: actions/checkout@v4
+        with:
+          repository: worldneedme/notebooklm-client-jeu
+          ref: ${{ inputs.source_sha }}
+          ssh-key: ${{ secrets.CLIENT_READ_KEY }}
+          persist-credentials: false
+          path: client
+
+      - name: Assert exact client commit
+        run: test "$(git -C client rev-parse HEAD)" = "${{ inputs.source_sha }}"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install, compile and unit-test
+        working-directory: client
+        run: |
+          npm ci --ignore-scripts
+          npx tsc
+          npx vitest run
+          npm pack --ignore-scripts
+          mkdir -p ../out
+          mv notebooklm-client-*.tgz ../out/notebooklm-client-next.tgz
+          sha256sum ../out/notebooklm-client-next.tgz
+
+      - name: Checkout nbl for lockfile regeneration
+        if: ${{ inputs.nbl_sha != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: worldneedme/nbl
+          ref: ${{ inputs.nbl_sha }}
+          ssh-key: ${{ secrets.SOURCE_READ_KEY }}
+          persist-credentials: false
+          path: nbl
+          sparse-checkout: |
+            package.json
+            package-lock.json
+          sparse-checkout-cone-mode: false
+
+      - name: Regenerate nbl package-lock.json
+        if: ${{ inputs.nbl_sha != '' }}
+        working-directory: nbl
+        run: |
+          mkdir -p vendor
+          cp ../out/notebooklm-client-next.tgz vendor/
+          npm install --package-lock-only --ignore-scripts
+          cp package-lock.json ../out/package-lock.json
+          grep -n '"node_modules/notebooklm-client-next"' -A4 package-lock.json
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notebooklm-client-next
+          path: out/
+          retention-days: 7
